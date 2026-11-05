@@ -5,7 +5,7 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { initializeApp as initializeAdminApp } from 'firebase-admin/app';
+import { initializeApp as initializeAdminApp, cert, ServiceAccount } from 'firebase-admin/app';
 import { getAuth as getAdminAuth, DecodedIdToken } from 'firebase-admin/auth';
 import { AppDatabase, AppUser, BallType, Match, Team, Tournament, Player, UserRole } from './src/types/cricket';
 import {
@@ -33,11 +33,32 @@ const FOUNDING_ADMIN_EMAIL = 'wasimmakrani531@gmail.com';
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Firebase Admin is used only to verify Google sign-in ID tokens (no service account needed)
-const firebaseConfig = JSON.parse(
-  fs.readFileSync(path.resolve(__dirname, 'firebase-applet-config.json'), 'utf-8')
+// Firebase Admin (verifies Google sign-in ID tokens). Credentials come from, in order:
+//   1. FIREBASE_SERVICE_ACCOUNT       — the service account JSON as a string (for hosted deploys)
+//   2. FIREBASE_SERVICE_ACCOUNT_PATH  — path to the service account JSON file
+//   3. secrets/firebase-service-account.json (git-ignored, for local dev)
+function loadServiceAccount(): ServiceAccount & { project_id?: string } {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  }
+  const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
+    ? path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
+    : path.resolve(__dirname, 'secrets', 'firebase-service-account.json');
+  if (!fs.existsSync(keyPath)) {
+    throw new Error(
+      `Firebase service account not found at ${keyPath}. Set FIREBASE_SERVICE_ACCOUNT or FIREBASE_SERVICE_ACCOUNT_PATH.`
+    );
+  }
+  return JSON.parse(fs.readFileSync(keyPath, 'utf-8'));
+}
+
+const serviceAccount = loadServiceAccount();
+const adminAuth = getAdminAuth(
+  initializeAdminApp(
+    { credential: cert(serviceAccount), projectId: serviceAccount.project_id },
+    'azad-live-admin'
+  )
 );
-const adminAuth = getAdminAuth(initializeAdminApp({ projectId: firebaseConfig.projectId }, 'azad-live-admin'));
 
 // Seeded demo accounts from the old email/password system. Their emails are on domains we don't
 // control, so anyone owning those domains could claim them via Google sign-in.

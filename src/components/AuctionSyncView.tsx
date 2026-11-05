@@ -92,11 +92,11 @@ export const AuctionSyncView: React.FC = () => {
   import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
 
   const firebaseConfig = {
-    projectId: "spiritual-pursuit-b2w8r",
-    appId: "1:97973658165:web:9584a02e5ce3a7b5bf477c",
-    apiKey: "AIzaSyBAskaEQt3Wv7Wbf8osrOvTw4_--wDmbQc",
-    authDomain: "spiritual-pursuit-b2w8r.firebaseapp.com",
-    firestoreDatabaseId: "ai-studio-universalcricket-4879961e-f882-4048-a2c8-8699c4a998ab"
+    projectId: "azad-live",
+    appId: "1:412408179252:web:30e29e0803439964917861",
+    apiKey: "AIzaSyC4uwg045u_n7e9KnE66e7vFh0UAwWYYgU",
+    authDomain: "azad-live.firebaseapp.com",
+    firestoreDatabaseId: "(default)"
   };
 
   const app = initializeApp(firebaseConfig);
