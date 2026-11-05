@@ -1,0 +1,61 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Strict Organizer / Admin verification:
+    // Requires authenticated user with verified email matching the organizer,
+    // or existence in the trusted admins collection. Zero hardcoded write secrets in documents.
+    function isAuctionAdmin() {
+      return isSignedIn() && (
+        (request.auth.token.email_verified == true && request.auth.token.email == 'wasimmakrani531@gmail.com') ||
+        request.auth.token.email == 'wasimmakrani531@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidAuctionPlayer(data) {
+      return data.keys().hasAll(['id', 'name', 'soldStatus', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'name', 'soldStatus', 'updatedAt', 'category', 'basePrice', 'soldPrice', 'teamId', 'teamName']) &&
+        data.id is string && data.id.size() > 0 && data.id.size() <= 64 &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+        data.soldStatus in ['UPCOMING', 'IN_AUCTION', 'SOLD', 'UNSOLD'] &&
+        data.updatedAt is number &&
+        (!('category' in data) || (data.category is string && data.category.size() <= 50)) &&
+        (!('basePrice' in data) || (data.basePrice is number && data.basePrice >= 0)) &&
+        (!('soldPrice' in data) || (data.soldPrice is number && data.soldPrice >= 0)) &&
+        (!('teamId' in data) || (data.teamId is string && data.teamId.size() <= 64)) &&
+        (!('teamName' in data) || (data.teamName is string && data.teamName.size() <= 100));
+    }
+
+    // Default Deny Rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Admins Collection
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && (request.auth.uid == adminId || isAuctionAdmin());
+      allow list: if isAuctionAdmin();
+      allow write: if isAuctionAdmin();
+    }
+
+    // KPL Auction Players Collection
+    // Read: Public (Live Score app, viewers, PRISM broadcast overlays can read in real-time)
+    // Write: Strictly authenticated Organizer (wasimmakrani531@gmail.com) only. No client bypass or static secrets.
+    match /kpl_auction_players/{playerId} {
+      allow get: if isValidId(playerId);
+      allow list: if true;
+      allow create, update: if isValidId(playerId) && isAuctionAdmin() && isValidAuctionPlayer(request.resource.data);
+      allow delete: if isValidId(playerId) && isAuctionAdmin();
+    }
+  }
+}

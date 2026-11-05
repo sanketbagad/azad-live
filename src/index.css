@@ -1,0 +1,178 @@
+@import "tailwindcss";
+@import "aos/dist/aos.css";
+
+/* ==========================================
+   AZAD LIVE THEME: "Night Match"
+   Floodlit navy base, electric cyan → violet brand gradient,
+   trophy amber accent, broadcast red for LIVE.
+   ========================================== */
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Teko", "Chakra Petch", ui-sans-serif, sans-serif;
+  --font-tech: "Chakra Petch", ui-sans-serif, sans-serif;
+
+  --color-ink-950: #05070f;
+  --color-ink-900: #0a0e1a;
+  --color-ink-850: #0e1322;
+  --color-ink-800: #131a2e;
+  --color-ink-700: #1c2540;
+  --color-ink-600: #2a3558;
+
+  --color-brand-300: #67e8f9;
+  --color-brand-400: #22d3ee;
+  --color-brand-500: #06b6d4;
+  --color-brand-600: #0891b2;
+
+  --color-pulse-400: #a78bfa;
+  --color-pulse-500: #8b5cf6;
+  --color-pulse-600: #7c3aed;
+
+  --color-trophy-300: #fcd34d;
+  --color-trophy-400: #fbbf24;
+  --color-trophy-500: #f59e0b;
+
+  --color-live-400: #f87171;
+  --color-live-500: #ef4444;
+  --color-live-600: #dc2626;
+
+  --color-pitch-400: #4ade80;
+  --color-pitch-500: #22c55e;
+
+  --animate-float: float 6s ease-in-out infinite;
+  --animate-spin-slow: spin 12s linear infinite;
+  --animate-shimmer: shimmer 2.5s linear infinite;
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-12px); }
+  }
+  @keyframes shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+}
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-ink-900 text-slate-100 font-sans antialiased;
+    overscroll-behavior-y: none;
+  }
+}
+
+@layer components {
+  /* Frosted panel used for cards and sheets */
+  .glass {
+    @apply bg-ink-850/70 backdrop-blur-xl border border-white/[0.06];
+  }
+
+  .card {
+    @apply bg-ink-850/70 backdrop-blur-xl border border-white/[0.06] rounded-2xl shadow-xl shadow-black/30;
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand-300 via-brand-400 to-pulse-400 bg-clip-text text-transparent;
+  }
+
+  .text-gradient-gold {
+    @apply bg-gradient-to-r from-trophy-300 to-trophy-500 bg-clip-text text-transparent;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 min-h-11 text-sm font-bold text-white
+      bg-gradient-to-r from-brand-500 to-pulse-500 shadow-lg shadow-brand-500/20
+      transition-all hover:brightness-110 active:scale-[0.97] disabled:opacity-60 disabled:pointer-events-none;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 min-h-11 text-sm font-semibold
+      text-slate-200 bg-white/[0.04] border border-white/[0.08] transition-all hover:bg-white/[0.08] active:scale-[0.97];
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider;
+  }
+
+  .live-dot {
+    @apply relative inline-flex h-2 w-2 rounded-full bg-live-500;
+  }
+  .live-dot::after {
+    content: "";
+    @apply absolute inset-0 rounded-full bg-live-500 animate-ping;
+  }
+
+  /* Soft floodlight glow behind pages */
+  .bg-stadium {
+    background:
+      radial-gradient(60rem 30rem at 15% -10%, rgb(34 211 238 / 0.12), transparent 60%),
+      radial-gradient(50rem 30rem at 100% 0%, rgb(139 92 246 / 0.12), transparent 60%),
+      var(--color-ink-900);
+  }
+
+  .shimmer {
+    background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.06), transparent);
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+}
+
+@layer utilities {
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ==========================================
+   Modal panels: bottom sheet on phones, centered dialog from sm: up
+   ========================================== */
+@layer components {
+  .sheet-backdrop {
+    @apply fixed inset-0 z-50 flex items-end sm:items-center justify-center sm:p-4 bg-black/70 backdrop-blur-sm;
+    animation: backdrop-in 0.2s ease-out;
+  }
+  .sheet {
+    @apply relative w-full max-h-[90dvh] overflow-y-auto rounded-t-3xl rounded-b-none sm:rounded-2xl pb-[max(1.25rem,env(safe-area-inset-bottom))];
+    animation: sheet-up 0.34s cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  /* Grab handle (phones only) */
+  .sheet::before {
+    content: "";
+    @apply block sm:hidden w-10 h-1.5 rounded-full bg-white/15 mx-auto -mt-2 mb-3;
+  }
+  @media (min-width: 640px) {
+    .sheet {
+      animation: sheet-pop 0.22s ease-out;
+    }
+  }
+}
+
+@keyframes backdrop-in {
+  from { opacity: 0; }
+}
+@keyframes sheet-up {
+  from { transform: translateY(100%); }
+}
+@keyframes sheet-pop {
+  from { opacity: 0; transform: scale(0.96) translateY(8px); }
+}

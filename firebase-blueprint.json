@@ -1,0 +1,62 @@
+{
+  "entities": {
+    "AuctionPlayer": {
+      "title": "AuctionPlayer",
+      "description": "Represents a cricket player in the KPL 5 player auction with sold status, price, and team allocation",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier of the player (e.g., p_01)",
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "description": "Full display name of the player",
+          "maxLength": 100
+        },
+        "category": {
+          "type": "string",
+          "description": "Playing category or role",
+          "enum": ["batter", "bowler", "all_rounder", "wicket_keeper", "Batsman", "Bowler", "All-Rounder", "Wicket-Keeper"]
+        },
+        "basePrice": {
+          "type": "number",
+          "description": "Starting base price in auction"
+        },
+        "soldStatus": {
+          "type": "string",
+          "enum": ["UPCOMING", "IN_AUCTION", "SOLD", "UNSOLD"],
+          "description": "Current state of the player in auction"
+        },
+        "teamId": {
+          "type": "string",
+          "description": "Unique ID of the winning team if sold",
+          "maxLength": 64
+        },
+        "teamName": {
+          "type": "string",
+          "description": "Display name of the winning team if sold",
+          "maxLength": 100
+        },
+        "soldPrice": {
+          "type": "number",
+          "description": "Winning bid amount"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp in milliseconds when the status was last changed"
+        }
+      },
+      "required": ["id", "name", "soldStatus", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/kpl_auction_players/{playerId}": {
+      "schema": {
+        "$ref": "#/entities/AuctionPlayer"
+      },
+      "description": "Live player auction roster synchronized between KPL Auction Control and KPL 5 Live Score App"
+    }
+  }
+}

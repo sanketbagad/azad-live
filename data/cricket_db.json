@@ -1,0 +1,18 @@
+{
+  "matches": {},
+  "tournaments": {},
+  "teams": {},
+  "players": {},
+  "users": {
+    "u_admin_owner": {
+      "id": "u_admin_owner",
+      "email": "wasimmakrani531@gmail.com",
+      "name": "Tournament Director",
+      "role": "admin",
+      "createdAt": 1791930583649,
+      "lastLoginAt": 1792145404621
+    }
+  },
+  "auctionSyncMap": {},
+  "lastUpdated": 1793807973957
+}
