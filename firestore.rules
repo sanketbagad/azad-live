@@ -47,6 +47,15 @@ service cloud.firestore {
       allow write: if isAuctionAdmin();
     }
 
+    // Live update signal: { version, updatedAt } only, bumped by the server on every save.
+    // Public so viewers can listen and re-fetch /api/state. Written only by the Admin SDK.
+    match /live_state/{docId} {
+      allow get: if true;
+    }
+
+    // app_state (the full database, including user accounts) is covered by the default
+    // deny rule above: only the server's Admin SDK can read or write it.
+
     // KPL Auction Players Collection
     // Read: Public (Live Score app, viewers, PRISM broadcast overlays can read in real-time)
     // Write: Strictly authenticated Organizer (wasimmakrani531@gmail.com) only. No client bypass or static secrets.

@@ -13,7 +13,8 @@ import {
 } from '../types/cricket';
 import { createEmptyDatabase } from '../utils/emptyDatabase';
 import { onAuthStateChanged, signInWithPopup, signOut, User as FirebaseUser } from 'firebase/auth';
-import { auth, googleProvider } from '../services/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { auth, googleProvider, db as firestoreDb } from '../services/firebase';
 
 interface CricketContextType {
   state: AppDatabase;
@@ -209,9 +210,61 @@ export const CricketProvider: React.FC<{ children: React.ReactNode }> = ({ child
     return () => window.removeEventListener('focus', onFocus);
   }, [firebaseUser, refreshCurrentUser]);
 
-  // Connect to SSE stream
+  // Live updates: SSE from a long-running server, or (on Vercel) a Firestore listener on
+  // live_state/current whose version changes on every save, followed by a state re-fetch.
   useEffect(() => {
     let reconnectTimeout: any;
+    let unsubscribeLive: (() => void) | null = null;
+    let disposed = false;
+
+    async function fetchState(): Promise<string | null> {
+      const res = await fetch('/api/state', { cache: 'no-store' });
+      const data = await res.json();
+      if (!disposed && data && data.matches) {
+        setState(data);
+        setConnectionStatus('connected');
+      }
+      return res.headers.get('X-Realtime');
+    }
+
+    function listenToFirestore() {
+      let lastVersion: number | null = null;
+      let fetching = false;
+      let refetchQueued = false;
+
+      const refetch = async () => {
+        if (fetching) {
+          refetchQueued = true;
+          return;
+        }
+        fetching = true;
+        try {
+          await fetchState();
+        } catch {
+          setConnectionStatus('offline');
+        } finally {
+          fetching = false;
+          if (refetchQueued && !disposed) {
+            refetchQueued = false;
+            refetch();
+          }
+        }
+      };
+
+      unsubscribeLive = onSnapshot(
+        doc(firestoreDb, 'live_state', 'current'),
+        (snap) => {
+          const version = Number(snap.get('version')) || 0;
+          setConnectionStatus('connected');
+          if (lastVersion !== null && version !== lastVersion) refetch();
+          lastVersion = version;
+        },
+        (err) => {
+          console.error('Live update listener error:', err);
+          setConnectionStatus('offline');
+        }
+      );
+    }
 
     function connectSSE() {
       setConnectionStatus('connecting');
@@ -241,21 +294,22 @@ export const CricketProvider: React.FC<{ children: React.ReactNode }> = ({ child
       };
     }
 
-    fetch('/api/state')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && data.matches) {
-          setState(data);
-          setConnectionStatus('connected');
-        }
+    fetchState()
+      .then((mode) => {
+        if (disposed) return;
+        if (mode === 'firestore') listenToFirestore();
+        else connectSSE();
       })
-      .catch(() => setConnectionStatus('offline'));
-
-    connectSSE();
+      .catch(() => {
+        setConnectionStatus('offline');
+        if (!disposed) connectSSE();
+      });
 
     return () => {
+      disposed = true;
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (eventSourceRef.current) eventSourceRef.current.close();
+      if (unsubscribeLive) unsubscribeLive();
     };
   }, []);
 

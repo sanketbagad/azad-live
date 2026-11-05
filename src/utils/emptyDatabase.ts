@@ -1,4 +1,4 @@
-import { AppDatabase } from '../types/cricket';
+import { AppDatabase } from '../types/cricket.js';
 
 /** A fresh database with no tournaments, teams, players, matches or accounts. */
 export function createEmptyDatabase(): AppDatabase {

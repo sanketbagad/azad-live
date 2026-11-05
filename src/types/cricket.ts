@@ -325,6 +325,8 @@ export interface AppDatabase {
   teams: Record<string, Team>;
   players: Record<string, Player>;
   users: Record<string, AppUser>;
+  /** Firestore auction catch-up cursor (serverless mode): highest updatedAt already applied */
+  auctionSyncCursor?: number;
   auctionSyncMap?: Record<string, { status: string; teamId?: string; soldPrice?: number; updatedAt: number }>;
   lastUpdated: number;
 }

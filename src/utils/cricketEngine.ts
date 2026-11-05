@@ -12,7 +12,7 @@ import {
   PointsTableEntry,
   Team,
   Tournament,
-} from '../types/cricket';
+} from '../types/cricket.js';
 
 /**
  * Format legal delivery count into cricket overs string (e.g. 23 balls -> "3.5", 24 balls -> "4.0")

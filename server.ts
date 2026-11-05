@@ -4,26 +4,32 @@ import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
+import zlib from 'zlib';
 import { initializeApp as initializeAdminApp, cert, ServiceAccount } from 'firebase-admin/app';
 import { getAuth as getAdminAuth, DecodedIdToken } from 'firebase-admin/auth';
-import { AppDatabase, AppUser, BallType, Match, Team, Tournament, Player, UserRole } from './src/types/cricket';
+import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
+import type { AppDatabase, AppUser, BallType, Match, Team, Tournament, Player, UserRole } from './src/types/cricket.js';
 import {
   createEmptyInnings,
   editDelivery,
   processDelivery,
   undoLastDelivery,
-} from './src/utils/cricketEngine';
-import { createEmptyDatabase } from './src/utils/emptyDatabase';
+} from './src/utils/cricketEngine.js';
+import { createEmptyDatabase } from './src/utils/emptyDatabase.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// On Vercel the app runs as a serverless function: no writable disk, no long-lived
+// connections, no child processes. State then lives in Firestore instead of a JSON file.
+const IS_SERVERLESS = Boolean(process.env.VERCEL);
+const USE_FIRESTORE_STORE = IS_SERVERLESS || process.env.DATA_STORE === 'firestore';
+
 const DATA_DIR = path.resolve(__dirname, 'data');
 const DB_FILE = path.resolve(DATA_DIR, 'cricket_db.json');
 
-// Ensure data folder exists
-if (!fs.existsSync(DATA_DIR)) {
+// Ensure data folder exists (local file store only)
+if (!USE_FIRESTORE_STORE && !fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
@@ -53,12 +59,12 @@ function loadServiceAccount(): ServiceAccount & { project_id?: string } {
 }
 
 const serviceAccount = loadServiceAccount();
-const adminAuth = getAdminAuth(
-  initializeAdminApp(
-    { credential: cert(serviceAccount), projectId: serviceAccount.project_id },
-    'azad-live-admin'
-  )
+const adminApp = initializeAdminApp(
+  { credential: cert(serviceAccount), projectId: serviceAccount.project_id },
+  'azad-live-admin'
 );
+const adminAuth = getAdminAuth(adminApp);
+const adminDb = getAdminFirestore(adminApp);
 
 // Seeded demo accounts from the old email/password system. Their emails are on domains we don't
 // control, so anyone owning those domains could claim them via Google sign-in.
@@ -102,8 +108,13 @@ function loadDatabase(): AppDatabase {
 }
 
 function saveDatabase(data: AppDatabase) {
+  data.lastUpdated = Date.now();
+  if (USE_FIRESTORE_STORE) {
+    // Written to Firestore before the response is sent (see the /api store middleware)
+    stateDirty = true;
+    return;
+  }
   try {
-    data.lastUpdated = Date.now();
     // Write to a temp file then rename, so a crash mid-write can't corrupt the database
     const tmpFile = `${DB_FILE}.tmp`;
     fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
@@ -113,8 +124,84 @@ function saveDatabase(data: AppDatabase) {
   }
 }
 
-dbState = loadDatabase();
-ensureFoundingAdmin();
+// ==========================================
+// FIRESTORE STATE STORE (serverless / DATA_STORE=firestore)
+// ==========================================
+// The whole database is one gzipped document (private: only the Admin SDK can read it).
+// live_state/current holds just a version number; it's publicly readable so browsers can
+// listen to it and re-fetch /api/state when it changes (replaces SSE on serverless).
+const STATE_DOC = adminDb.collection('app_state').doc('main');
+const LIVE_DOC = adminDb.collection('live_state').doc('current');
+const MAX_STATE_BYTES = 1_000_000; // Firestore document limit is ~1 MiB
+
+let stateVersion = -1; // version dbState was loaded at / last saved as (-1 = not loaded)
+let stateDirty = false;
+let flushChain: Promise<void> = Promise.resolve();
+
+class StateConflictError extends Error {}
+
+async function refreshStateFromFirestore(): Promise<void> {
+  if (stateDirty) return; // unsaved local changes are saved first
+  const live = await LIVE_DOC.get();
+  const remoteVersion = live.exists ? Number(live.get('version')) || 0 : 0;
+  if (dbState && remoteVersion === stateVersion) return;
+
+  const snap = await STATE_DOC.get();
+  if (stateDirty) return; // another request changed state while we were reading
+  if (snap.exists) {
+    const json = zlib.gunzipSync(snap.get('data') as Buffer).toString('utf-8');
+    dbState = migrateLegacyAuth(JSON.parse(json));
+    stateVersion = Number(snap.get('version')) || 0;
+  } else {
+    console.log('🆕 [AZAD LIVE] No database in Firestore yet, starting with an empty one.');
+    dbState = migrateLegacyAuth(createEmptyDatabase());
+    stateVersion = 0;
+    stateDirty = true;
+  }
+  ensureFoundingAdmin();
+}
+
+/** Saves dbState if it changed. Rejects with StateConflictError if another instance saved first. */
+function flushState(): Promise<void> {
+  const run = flushChain.then(async () => {
+    if (!stateDirty) return;
+    stateDirty = false;
+    const data = zlib.gzipSync(Buffer.from(JSON.stringify(dbState), 'utf-8'));
+    if (data.length > MAX_STATE_BYTES) {
+      stateDirty = true;
+      throw new Error(`Database is too large for Firestore (${data.length} bytes compressed).`);
+    }
+    const baseVersion = stateVersion;
+    try {
+      stateVersion = await adminDb.runTransaction(async (tx) => {
+        const live = await tx.get(LIVE_DOC);
+        const current = live.exists ? Number(live.get('version')) || 0 : 0;
+        if (current !== baseVersion) {
+          throw new StateConflictError(`State changed elsewhere (v${current}, expected v${baseVersion})`);
+        }
+        const version = baseVersion + 1;
+        const updatedAt = Date.now();
+        tx.set(STATE_DOC, { data, version, updatedAt });
+        tx.set(LIVE_DOC, { version, updatedAt });
+        return version;
+      });
+    } catch (err) {
+      if (err instanceof StateConflictError) {
+        stateVersion = -1; // discard this instance's copy; the next request reloads
+      } else {
+        stateDirty = true; // keep the change so the next save retries it
+      }
+      throw err;
+    }
+  });
+  flushChain = run.catch(() => {});
+  return run;
+}
+
+if (!USE_FIRESTORE_STORE) {
+  dbState = loadDatabase();
+  ensureFoundingAdmin();
+}
 
 /** Guarantees at least one admin exists so the platform can always be managed. */
 function ensureFoundingAdmin() {
@@ -278,14 +365,66 @@ function pickFields<T extends object>(body: any, fields: readonly string[]): Par
   return picked;
 }
 
-async function startServer() {
+/**
+ * Builds the Express app with every API route. Used directly by the Vercel function
+ * (api/index.ts) and by startServer() for the long-running local / container server.
+ */
+export async function createApp() {
   const app = express();
-  const server = http.createServer(app);
-  const PORT = Number(process.env.PORT) || 3000;
-  const isProd = process.env.NODE_ENV === 'production';
 
-  // Trust the first proxy (Cloud Run / reverse proxy) so req.ip is the real client IP for rate limiting
+  // Trust the first proxy (Vercel / Cloud Run / reverse proxy) so req.ip is the real client IP for rate limiting
   app.set('trust proxy', 1);
+
+  // Firestore store: load the latest state before each API request, and hold the
+  // response until any change it made is saved (a serverless instance can be frozen
+  // as soon as the response is sent).
+  let lastAuctionCatchUp = 0;
+  app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
+    if (!USE_FIRESTORE_STORE) return next();
+    try {
+      await refreshStateFromFirestore();
+      if (IS_SERVERLESS && Date.now() - lastAuctionCatchUp > 15_000) {
+        lastAuctionCatchUp = Date.now();
+        await catchUpAuctionFromFirestore();
+      }
+    } catch (err) {
+      console.error('[AZAD LIVE] Could not load state from Firestore:', err);
+      return res.status(503).json({ error: 'Database temporarily unavailable. Please retry.' });
+    }
+
+    const originalEnd = res.end.bind(res) as (...args: any[]) => Response;
+    (res as any).end = (...args: any[]) => {
+      if (!stateDirty) return originalEnd(...args);
+      flushState().then(
+        () => originalEnd(...args),
+        (err) => {
+          const conflict = err instanceof StateConflictError;
+          console.error('[AZAD LIVE] Could not save state:', err);
+          if (res.headersSent) return originalEnd(...args);
+          const body = JSON.stringify({
+            error: conflict
+              ? 'Someone else updated the data at the same moment. Please retry.'
+              : 'Could not save your change. Please retry.',
+          });
+          res.statusCode = conflict ? 409 : 500;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Content-Length', Buffer.byteLength(body));
+          originalEnd(body);
+        }
+      );
+      return res;
+    };
+    next();
+  });
+
+  // Live streaming relays video through ffmpeg in a long-running process: not possible on serverless
+  if (IS_SERVERLESS) {
+    app.use(['/api/stream/start', '/api/stream/chunk', '/api/stream/end'], (req: Request, res: Response) => {
+      res.status(501).json({
+        error: 'Live streaming to YouTube is not available on this deployment (Vercel can\'t run ffmpeg). Use OBS with the overlay links instead.',
+      });
+    });
+  }
 
   // Binary streaming chunk ingest middleware
   app.use('/api/stream/chunk', express.raw({ type: '*/*', limit: '50mb' }));
@@ -333,8 +472,12 @@ async function startServer() {
     return writeLimiter(req, res, next);
   });
 
-  // SSE Real-Time Sync Endpoint (Public)
+  // SSE Real-Time Sync Endpoint (Public). Not available on serverless: browsers listen to
+  // Firestore live_state/current instead (see X-Realtime header on /api/state).
   app.get('/api/live/stream', (req: Request, res: Response) => {
+    if (IS_SERVERLESS) {
+      return res.status(404).json({ error: 'Live stream not available here; use Firestore live_state.' });
+    }
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -363,6 +506,9 @@ async function startServer() {
 
   // Get full database state (Public - sanitized)
   app.get('/api/state', (req: Request, res: Response) => {
+    // Tells the browser how to receive live updates: SSE (long-running server) or Firestore (serverless)
+    res.setHeader('X-Realtime', IS_SERVERLESS ? 'firestore' : 'sse');
+    res.setHeader('Cache-Control', 'no-store');
     res.json(getSanitizedDbState());
   });
 
@@ -1423,22 +1569,50 @@ async function startServer() {
       res.status(500).json({ error: err.message });
     }
   });
-  const publicDir = path.resolve(__dirname, 'public');
-  app.use(express.static(publicDir));
+  /**
+   * Serverless replacement for the auction listener below: applies auction results the
+   * HTML auction tool wrote to kpl_auction_players since the last check. Runs at most
+   * every 15s per instance, on API requests. applyAuctionSync is idempotent.
+   */
+  async function catchUpAuctionFromFirestore() {
+    const cursor = dbState.auctionSyncCursor || 0;
+    const snapshot = await adminDb
+      .collection('kpl_auction_players')
+      .where('updatedAt', '>', cursor)
+      .orderBy('updatedAt')
+      .limit(200)
+      .get();
+    if (snapshot.empty) return;
 
-  // Mount Vite or static server
-  if (!isProd) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    let newCursor = cursor;
+    snapshot.forEach((docSnap) => {
+      const data = docSnap.data() as any;
+      if (data && (data.soldStatus === 'SOLD' || data.soldStatus === 'UNSOLD')) {
+        applyAuctionSync(
+          {
+            id: docSnap.id,
+            name: data.name,
+            category: data.category,
+            teamId: data.teamId,
+            teamName: data.teamName,
+            soldPrice: data.soldPrice,
+            basePrice: data.basePrice,
+            status: data.soldStatus,
+            updatedAt: data.updatedAt || Date.now(),
+          },
+          'firestore_listener'
+        );
+      }
+      newCursor = Math.max(newCursor, Number(data?.updatedAt) || 0);
     });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
-    });
+    dbState.auctionSyncCursor = newCursor;
+    saveDatabase(dbState);
+    try {
+      await flushState();
+    } catch (err) {
+      // Another instance saved first; it (or the next check) will apply these results
+      console.warn('[AZAD LIVE] Auction catch-up not saved:', (err as Error).message);
+    }
   }
 
   async function initServerFirestoreAuctionListener() {
@@ -1514,13 +1688,51 @@ async function startServer() {
     }
   }
 
+  return { app, initServerFirestoreAuctionListener };
+}
+
+/** Long-running server (local dev / containers): adds the website and the auction listener. */
+async function startServer() {
+  const { app, initServerFirestoreAuctionListener } = await createApp();
+  const server = http.createServer(app);
+  const PORT = Number(process.env.PORT) || 3000;
+  const isProd = process.env.NODE_ENV === 'production';
+
+  if (USE_FIRESTORE_STORE) {
+    await refreshStateFromFirestore();
+    await flushState();
+  }
+
+  const publicDir = path.resolve(__dirname, 'public');
+  app.use(express.static(publicDir));
+
+  // Mount Vite or static server
+  if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(__dirname, 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  }
+
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`🏏 AZAD LIVE Cricket Platform Server running on http://0.0.0.0:${PORT}`);
+    console.log(`💾 [AZAD LIVE] Data store: ${USE_FIRESTORE_STORE ? 'Firestore (app_state/main)' : DB_FILE}`);
     initServerFirestoreAuctionListener();
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start AZAD LIVE Cricket Platform Server:', err);
-  process.exit(1);
-});
+// On Vercel, api/index.ts imports createApp() instead of starting a server
+if (!IS_SERVERLESS) {
+  startServer().catch((err) => {
+    console.error('Failed to start AZAD LIVE Cricket Platform Server:', err);
+    process.exit(1);
+  });
+}

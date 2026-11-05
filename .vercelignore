@@ -1,0 +1,10 @@
+# Never upload secrets or local data to Vercel
+secrets/
+*firebase-adminsdk*.json
+.env
+.env.*
+!.env.example
+data/
+.quarantine/
+.master_upgrade_backup/
+.aistudio/

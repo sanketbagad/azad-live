@@ -16,7 +16,7 @@
       "id": "u_1793866289709_drsq",
       "email": "alencolins@gmail.com",
       "name": "Sanket Bagad",
-      "role": "viewer",
+      "role": "admin",
       "createdAt": 1793866289709,
       "firebaseUid": "Yaj1XAc8UFhXbAL1Vc8CFapTAME3",
       "photoURL": "https://lh3.googleusercontent.com/a/ACg8ocK4fgQmyj8Cu5of5ThGq3m4SZili27kZRPiD7FT2TgUWfv66xKx=s96-c",
@@ -24,5 +24,5 @@
     }
   },
   "auctionSyncMap": {},
-  "lastUpdated": 1793866289709
+  "lastUpdated": 1793867527109
 }
