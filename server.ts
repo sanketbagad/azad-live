@@ -45,7 +45,19 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 //   3. secrets/firebase-service-account.json (git-ignored, for local dev)
 function loadServiceAccount(): ServiceAccount & { project_id?: string } {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    try {
+      const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT.trim());
+      if (!parsed.private_key || !parsed.client_email) throw new Error('missing fields');
+      return parsed;
+    } catch {
+      // Never include the parse error: it can quote part of the private key
+      throw new Error(
+        'FIREBASE_SERVICE_ACCOUNT is set but is not valid service account JSON. Paste the whole contents of the key file.'
+      );
+    }
+  }
+  if (process.env.VERCEL) {
+    throw new Error('FIREBASE_SERVICE_ACCOUNT environment variable is not set on Vercel (then redeploy).');
   }
   const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH
     ? path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_PATH)
