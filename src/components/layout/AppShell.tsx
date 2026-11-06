@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
+import { AnimatePresence, motion, useDragControls } from 'motion/react';
 import { LayoutGrid, LogOut, X, Activity, RefreshCw } from 'lucide-react';
 import { useCricket } from '../../context/CricketContext';
 import {
@@ -52,8 +52,20 @@ export const AppShell: React.FC<AppShellProps> = ({ currentTab, onNavigate, scor
   const currentDef = getTab(currentTab);
   const isMoreActive = !primaryKeys.includes(currentTab);
 
+  const sheetDrag = useDragControls();
+
   // Close the sheet when navigating
   useEffect(() => setMoreOpen(false), [currentTab]);
+
+  // Lock the page behind the open sheet so swipes scroll the menu, not the page
+  useEffect(() => {
+    if (!moreOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [moreOpen]);
 
   const go = (tab: TabKey) => {
     onNavigate(tab);
@@ -268,19 +280,28 @@ export const AppShell: React.FC<AppShellProps> = ({ currentTab, onNavigate, scor
               onClick={() => setMoreOpen(false)}
             />
             <motion.div
-              className="lg:hidden fixed inset-x-0 bottom-0 z-50 max-h-[85dvh] overflow-y-auto rounded-t-3xl bg-ink-850 border-t border-white/10 pb-safe"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Menu"
+              className="lg:hidden fixed inset-x-0 bottom-0 z-50 max-h-[85dvh] flex flex-col rounded-t-3xl bg-ink-850 border-t border-white/10 pb-safe"
               initial={{ y: '100%' }}
               animate={{ y: 0 }}
               exit={{ y: '100%' }}
               transition={{ type: 'spring', stiffness: 380, damping: 36 }}
+              // Drag-to-close only from the handle/header, so the list below can scroll normally on touch
               drag="y"
+              dragListener={false}
+              dragControls={sheetDrag}
               dragConstraints={{ top: 0, bottom: 0 }}
               dragElastic={{ top: 0, bottom: 0.6 }}
               onDragEnd={(_, info) => {
                 if (info.offset.y > 100 || info.velocity.y > 500) setMoreOpen(false);
               }}
             >
-              <div className="sticky top-0 bg-ink-850 pt-3 pb-2 px-5 z-10">
+              <div
+                className="shrink-0 pt-3 pb-3 px-5 border-b border-white/[0.05] touch-none cursor-grab active:cursor-grabbing"
+                onPointerDown={(e) => sheetDrag.start(e)}
+              >
                 <div className="w-10 h-1.5 rounded-full bg-white/15 mx-auto mb-4" />
                 <div className="flex items-center gap-3">
                   <Avatar user={currentUser} size={44} />
@@ -298,7 +319,7 @@ export const AppShell: React.FC<AppShellProps> = ({ currentTab, onNavigate, scor
                 </div>
               </div>
 
-              <div className="px-5 pt-2 pb-6 space-y-5">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y px-5 pt-4 pb-6 space-y-5">
                 {groupedNav.map(({ group, tabs }) => (
                   <div key={group}>
                     <div className="text-[10px] uppercase tracking-[0.15em] text-slate-500 font-bold mb-2">

@@ -1,5 +1,6 @@
 import { Match, BallDelivery, CustomStreamLogos } from '../types/cricket';
 import { calculateRunRate, calculateRequiredRunRate } from '../utils/cricketEngine';
+import type { ReplayBuffer, ReplayFrame } from './replayBuffer';
 
 // In-memory HTML image cache for smooth 30fps canvas rendering
 const imageElementCache = new Map<string, HTMLImageElement>();
@@ -25,6 +26,25 @@ export interface CompositorOptions {
   showRecentBalls?: boolean;
   showEventAlerts?: boolean;
   customLogos?: CustomStreamLogos;
+  /** Instant-replay buffer (owned by the caller so it survives compositor restarts) */
+  replayBuffer?: ReplayBuffer;
+}
+
+export interface ReplayRequest {
+  /** How many seconds of footage to replay */
+  seconds: number;
+  /** Playback speed: 1 = real time, 0.5 = slow motion */
+  speed?: number;
+  /** Caption shown on the replay graphic, e.g. "SIX • Rohit" */
+  caption?: string;
+  onEnd?: () => void;
+}
+
+export interface ReplayStatus {
+  active: boolean;
+  /** 0..1 */
+  progress: number;
+  speed: number;
 }
 
 export interface CompositorController {
@@ -32,7 +52,13 @@ export interface CompositorController {
   getCanvas: () => HTMLCanvasElement;
   getStream: () => MediaStream;
   triggerEvent: (type: 'boundary_four' | 'boundary_six' | 'wicket', text?: string) => void;
+  /** Starts an instant replay of buffered camera footage. Returns false if there isn't enough footage. */
+  startReplay: (request: ReplayRequest) => boolean;
+  stopReplay: () => void;
+  getReplayStatus: () => ReplayStatus;
 }
+
+const REPLAY_STINGER_MS = 550;
 
 export function createVideoCompositor(
   videoElement: HTMLVideoElement | null,
@@ -84,11 +110,194 @@ export function createVideoCompositor(
     };
   }
 
+  // ---------- Instant replay playback ----------
+  let replay: {
+    frames: ReplayFrame[];
+    speed: number;
+    caption: string;
+    startedAt: number;
+    endedAt: number | null;
+    frameIdx: number;
+    loadedIdx: number;
+    bitmap: ImageBitmap | null;
+    decoding: boolean;
+    onEnd?: () => void;
+  } | null = null;
+
+  function startReplay(request: ReplayRequest): boolean {
+    const frames = options.replayBuffer?.snapshot(request.seconds) || [];
+    if (frames.length < 5) return false;
+    finishReplay(false);
+    replay = {
+      frames,
+      speed: request.speed || 1,
+      caption: request.caption || '',
+      startedAt: performance.now(),
+      endedAt: null,
+      frameIdx: 0,
+      loadedIdx: -1,
+      bitmap: null,
+      decoding: false,
+      onEnd: request.onEnd,
+    };
+    return true;
+  }
+
+  function finishReplay(notify = true) {
+    if (!replay) return;
+    const done = replay;
+    replay = null;
+    done.bitmap?.close?.();
+    if (notify) done.onEnd?.();
+  }
+
+  function replayDurationMs(r: NonNullable<typeof replay>) {
+    return (r.frames[r.frames.length - 1].t - r.frames[0].t) / r.speed;
+  }
+
+  function getReplayStatus(): ReplayStatus {
+    if (!replay) return { active: false, progress: 0, speed: 1 };
+    const total = replayDurationMs(replay) || 1;
+    const progress = Math.min(1, (performance.now() - replay.startedAt) / total);
+    return { active: true, progress, speed: replay.speed };
+  }
+
+  /** Draws the current replay frame. Returns false once the replay has finished. */
+  function drawReplay(time: number): boolean {
+    const r = replay;
+    if (!r || !ctx) return false;
+    const footageMs = (time - r.startedAt) * r.speed;
+    const target = r.frames[0].t + footageMs;
+    const last = r.frames[r.frames.length - 1];
+
+    // Outro: hold the last frame under the closing stinger, then return to live
+    if (target > last.t) {
+      if (r.endedAt === null) r.endedAt = time;
+      if (time - r.endedAt > REPLAY_STINGER_MS) {
+        finishReplay(true);
+        return false;
+      }
+    }
+
+    while (r.frameIdx < r.frames.length - 1 && r.frames[r.frameIdx + 1].t <= target) r.frameIdx++;
+
+    if (r.frameIdx !== r.loadedIdx && !r.decoding) {
+      const idx = r.frameIdx;
+      r.decoding = true;
+      createImageBitmap(r.frames[idx].blob)
+        .then((bmp) => {
+          if (replay !== r) {
+            bmp.close();
+            return;
+          }
+          r.bitmap?.close();
+          r.bitmap = bmp;
+          r.loadedIdx = idx;
+        })
+        .catch(() => {})
+        .finally(() => {
+          r.decoding = false;
+        });
+    }
+
+    if (r.bitmap) {
+      ctx.drawImage(r.bitmap, 0, 0, width, height);
+    } else {
+      ctx.fillStyle = '#05070f';
+      ctx.fillRect(0, 0, width, height);
+    }
+    return true;
+  }
+
+  function drawReplayGraphics(time: number) {
+    const r = replay;
+    if (!r || !ctx) return;
+    const s = height / 720;
+    const total = replayDurationMs(r) || 1;
+    const progress = Math.min(1, (time - r.startedAt) / total);
+
+    // Slight vignette so it reads as "not live"
+    const vignette = ctx.createRadialGradient(width / 2, height / 2, height * 0.35, width / 2, height / 2, height * 0.9);
+    vignette.addColorStop(0, 'rgba(0,0,0,0)');
+    vignette.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, width, height);
+
+    // REPLAY bug (top-left)
+    const bugX = Math.round(24 * s);
+    const bugY = Math.round(24 * s);
+    const bugH = Math.round(44 * s);
+    const label = r.speed < 1 ? 'SLOW-MO REPLAY' : 'REPLAY';
+    ctx.font = `900 ${Math.round(22 * s)}px 'Inter', sans-serif`;
+    const labelW = ctx.measureText(label).width;
+    const bugW = Math.round(labelW + 76 * s);
+    ctx.fillStyle = 'rgba(5,7,15,0.82)';
+    roundRect(ctx, bugX, bugY, bugW, bugH, 10 * s);
+    ctx.fill();
+    const grad = ctx.createLinearGradient(bugX, 0, bugX + bugW, 0);
+    grad.addColorStop(0, '#06b6d4');
+    grad.addColorStop(1, '#8b5cf6');
+    ctx.fillStyle = grad;
+    roundRect(ctx, bugX, bugY, Math.round(44 * s), bugH, 10 * s);
+    ctx.fill();
+    // Rewind icon
+    ctx.fillStyle = '#fff';
+    const ix = bugX + 22 * s;
+    const iy = bugY + bugH / 2;
+    ctx.beginPath();
+    ctx.moveTo(ix + 2 * s, iy - 9 * s);
+    ctx.lineTo(ix - 7 * s, iy);
+    ctx.lineTo(ix + 2 * s, iy + 9 * s);
+    ctx.moveTo(ix + 11 * s, iy - 9 * s);
+    ctx.lineTo(ix + 2 * s, iy);
+    ctx.lineTo(ix + 11 * s, iy + 9 * s);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, bugX + 56 * s, iy + 1 * s);
+
+    if (r.speed < 1) {
+      ctx.font = `800 ${Math.round(14 * s)}px 'Inter', sans-serif`;
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText(`${r.speed}x`, bugX + bugW + 10 * s, iy + 1 * s);
+    }
+    if (r.caption) {
+      ctx.font = `700 ${Math.round(16 * s)}px 'Inter', sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.fillText(r.caption, bugX, bugY + bugH + 18 * s);
+    }
+
+    // Progress bar along the top edge
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.fillRect(0, 0, width, Math.max(3, 5 * s));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, width * progress, Math.max(3, 5 * s));
+
+    // Stinger wipe on the way in and out
+    const sinceStart = time - r.startedAt;
+    const sinceEnd = r.endedAt === null ? null : time - r.endedAt;
+    let wipe: number | null = null;
+    if (sinceStart < REPLAY_STINGER_MS) wipe = 1 - sinceStart / REPLAY_STINGER_MS;
+    else if (sinceEnd !== null) wipe = Math.min(1, sinceEnd / REPLAY_STINGER_MS);
+    if (wipe !== null && wipe > 0) drawStinger(ctx, width, height, wipe);
+  }
+
   function render(time: number) {
     if (!isRunning || !ctx) return;
 
-    // 1. Draw video background or professional stadium virtual turf
-    if (videoElement && videoElement.readyState >= 2 && videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
+    const videoReady = Boolean(
+      videoElement && videoElement.readyState >= 2 && videoElement.videoWidth > 0 && videoElement.videoHeight > 0
+    );
+    // Keep buffering live camera footage, even while a replay is on screen
+    if (videoReady && options.replayBuffer) {
+      options.replayBuffer.capture(videoElement!, videoElement!.videoWidth, videoElement!.videoHeight, time);
+    }
+
+    // 1. Draw replay, live video, or the virtual stadium background
+    if (replay && drawReplay(time)) {
+      // replay frame drawn
+    } else if (videoReady && videoElement) {
       const vWidth = videoElement.videoWidth;
       const vHeight = videoElement.videoHeight;
       const videoRatio = vWidth / vHeight;
@@ -195,8 +404,13 @@ export function createVideoCompositor(
       drawScoreboardLowerThird(ctx, width, height, match, options);
     }
 
+    // 3b. Replay graphics (bug, progress, stinger)
+    if (replay) {
+      drawReplayGraphics(time);
+    }
+
     // 4. Draw Animated Event Splash (4, 6, Wicket)
-    if (options.showEventAlerts !== false && activeEvent) {
+    if (options.showEventAlerts !== false && activeEvent && !replay) {
       const elapsed = time - activeEvent.startTime;
       if (elapsed < activeEvent.duration) {
         drawEventAnimationSplash(ctx, width, height, activeEvent, elapsed);
@@ -216,11 +430,45 @@ export function createVideoCompositor(
     stop: () => {
       isRunning = false;
       cancelAnimationFrame(animationFrameId);
+      finishReplay(false);
     },
     getCanvas: () => canvasElement,
     getStream: () => stream,
     triggerEvent,
+    startReplay,
+    stopReplay: () => finishReplay(true),
+    getReplayStatus,
   };
+}
+
+/** Diagonal brand-colored wipe used when entering/leaving a replay. amount: 0 (none) .. 1 (full) */
+function drawStinger(ctx: CanvasRenderingContext2D, width: number, height: number, amount: number) {
+  const eased = amount * amount * (3 - 2 * amount);
+  const span = width + height;
+  const x = -height + span * eased;
+  ctx.save();
+  const grad = ctx.createLinearGradient(0, 0, width, height);
+  grad.addColorStop(0, '#06b6d4');
+  grad.addColorStop(1, '#7c3aed');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(-height, 0);
+  ctx.lineTo(x + height * 0.3, 0);
+  ctx.lineTo(x - height * 0.3, height);
+  ctx.lineTo(-height, height);
+  ctx.closePath();
+  ctx.fill();
+  if (eased > 0.55) {
+    ctx.globalAlpha = Math.min(1, (eased - 0.55) / 0.3);
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `900 ${Math.round(height * 0.075)}px 'Inter', sans-serif`;
+    ctx.fillText('AZAD LIVE', width / 2, height / 2 - height * 0.03);
+    ctx.font = `800 ${Math.round(height * 0.035)}px 'Inter', sans-serif`;
+    ctx.fillText('ACTION REPLAY', width / 2, height / 2 + height * 0.045);
+  }
+  ctx.restore();
 }
 
 /**

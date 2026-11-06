@@ -68,8 +68,8 @@ const PublicShareView: React.FC = () => (
         </a>
       </div>
     </header>
-    <main className="max-w-5xl mx-auto px-4 py-5">
-      <PublicLiveScoreView />
+    <main className="max-w-5xl mx-auto px-4 py-5 pb-safe">
+      <PublicLiveScoreView stickyTopClass="top-[calc(3.5rem+env(safe-area-inset-top))]" />
     </main>
   </div>
 );

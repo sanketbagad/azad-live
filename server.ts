@@ -25,8 +25,11 @@ const __dirname = path.dirname(__filename);
 const IS_SERVERLESS = Boolean(process.env.VERCEL);
 const USE_FIRESTORE_STORE = IS_SERVERLESS || process.env.DATA_STORE === 'firestore';
 
-const DATA_DIR = path.resolve(__dirname, 'data');
-const DB_FILE = path.resolve(DATA_DIR, 'cricket_db.json');
+// DATA_FILE lets you point a local server at another database file (e.g. demo/test data)
+const DB_FILE = process.env.DATA_FILE
+  ? path.resolve(process.env.DATA_FILE)
+  : path.resolve(__dirname, 'data', 'cricket_db.json');
+const DATA_DIR = path.dirname(DB_FILE);
 
 // Ensure data folder exists (local file store only)
 if (!USE_FIRESTORE_STORE && !fs.existsSync(DATA_DIR)) {
@@ -427,6 +430,11 @@ export async function createApp() {
       return res;
     };
     next();
+  });
+
+  // Lets the studio know whether "Go Live to YouTube" can run here (needs ffmpeg on a long-running server)
+  app.get('/api/stream/capabilities', (req: Request, res: Response) => {
+    res.json({ youtubeRelay: !IS_SERVERLESS });
   });
 
   // Live streaming relays video through ffmpeg in a long-running process: not possible on serverless

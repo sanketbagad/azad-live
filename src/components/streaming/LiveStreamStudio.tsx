@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useCricket } from '../../context/CricketContext';
 import { Match, StreamQualityPreset, StreamHealthStatus, CustomStreamLogos } from '../../types/cricket';
-import { createVideoCompositor, CompositorController } from '../../services/videoCompositor';
+import { createVideoCompositor, CompositorController, ReplayStatus } from '../../services/videoCompositor';
+import { ReplayBuffer } from '../../services/replayBuffer';
 import {
   Video,
   VideoOff,
@@ -36,6 +37,12 @@ import {
   RefreshCw,
   HelpCircle,
   Check,
+  Rewind,
+  Gauge,
+  Download,
+  Circle,
+  Smartphone,
+  Monitor,
 } from 'lucide-react';
 
 export type MediaDeviceErrorCategory =
@@ -423,6 +430,32 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
   const chunkQueueRef = useRef<Blob[]>([]);
   const isUploadingRef = useRef(false);
 
+  // ---------- Instant replay ----------
+  const replayBufferRef = useRef<ReplayBuffer | null>(null);
+  if (!replayBufferRef.current) replayBufferRef.current = new ReplayBuffer(35, 15);
+  const [replayStatus, setReplayStatus] = useState<ReplayStatus>({ active: false, progress: 0, speed: 1 });
+  const [bufferedSeconds, setBufferedSeconds] = useState(0);
+  const [slowMo, setSlowMo] = useState(false);
+  const [autoReplay, setAutoReplay] = useState(() => localStorage.getItem('azad_auto_replay') !== 'off');
+  const [saveReplayClips, setSaveReplayClips] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<any>(null);
+
+  // ---------- Local match recording ----------
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordStartedAt, setRecordStartedAt] = useState<number | null>(null);
+  const [recordElapsed, setRecordElapsed] = useState('00:00');
+  const recordRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordContinueRef = useRef(false);
+  const recordSplitTimerRef = useRef<any>(null);
+  const recordPartRef = useRef(1);
+
+  // ---------- Where "Go Live" can run ----------
+  // null = unknown yet; false = this deployment can't relay to YouTube (e.g. Vercel)
+  const [relayAvailable, setRelayAvailable] = useState<boolean | null>(null);
+  const [isGoLiveGuideOpen, setIsGoLiveGuideOpen] = useState(false);
+  const [copiedOverlay, setCopiedOverlay] = useState<string | null>(null);
+
   const canBroadcast = Boolean(selectedMatchId) && canScoreMatch(selectedMatchId);
 
   // Enumerate devices on mount
@@ -518,6 +551,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
         showRecentBalls: true,
         showEventAlerts,
         customLogos,
+        replayBuffer: replayBufferRef.current ?? undefined,
       }
     );
   }, [qualityPreset, showScoreboard, showWatermark, showEventAlerts, customLogos]);
@@ -769,6 +803,12 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
       return;
     }
 
+    // This deployment can't relay video to YouTube: show how to go live with a streaming app
+    if (relayAvailable === false) {
+      setIsGoLiveGuideOpen(true);
+      return;
+    }
+
     // Ensure compositor is initialized
     if (!compositorRef.current) {
       initCompositor();
@@ -871,6 +911,10 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
       setIsConnecting(false);
       setIsStreaming(false);
       setStatusMessage(`Failed to go live: ${err.message}`);
+      if (/not available/i.test(err.message || '')) {
+        setRelayAvailable(false);
+        setIsGoLiveGuideOpen(true);
+      }
     }
   };
 
@@ -919,17 +963,238 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
     setTimeout(() => setCopiedUrl(false), 2500);
   };
 
+  // ==========================================
+  // INSTANT REPLAY, CLIPS & RECORDING
+  // ==========================================
+
+  const showToast = (message: string) => {
+    setToast(message);
+    clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 2800);
+  };
+
+  const pickRecorderMime = () => {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4;codecs=avc1,mp4a',
+      'video/mp4',
+    ];
+    return candidates.find((c) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c)) || '';
+  };
+  const fileExt = (mime: string) => (mime.includes('mp4') ? 'mp4' : 'webm');
+  const fileStamp = () => new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  };
+
+  /** Replays the last `seconds` of camera footage on the output (and optionally saves it as a clip). */
+  const handleReplay = (seconds: number, opts?: { speed?: number; caption?: string; auto?: boolean }) => {
+    const compositor = compositorRef.current;
+    if (!compositor) return;
+    const speed = opts?.speed ?? (slowMo ? 0.5 : 1);
+
+    let clipRecorder: MediaRecorder | null = null;
+    const clipChunks: Blob[] = [];
+    const started = compositor.startReplay({
+      seconds,
+      speed,
+      caption: opts?.caption,
+      onEnd: () => {
+        setReplayStatus({ active: false, progress: 0, speed: 1 });
+        if (clipRecorder && clipRecorder.state !== 'inactive') clipRecorder.stop();
+      },
+    });
+
+    if (!started) {
+      if (!opts?.auto) {
+        showToast(isCameraActive ? 'Not enough footage yet. Give it a few seconds.' : 'Turn the camera on to use replays.');
+      }
+      return;
+    }
+    setReplayStatus({ active: true, progress: 0, speed });
+
+    if (saveReplayClips && typeof MediaRecorder !== 'undefined') {
+      try {
+        const mime = pickRecorderMime();
+        clipRecorder = new MediaRecorder(compositor.getStream(), mime ? { mimeType: mime, videoBitsPerSecond: 3_000_000 } : undefined);
+        clipRecorder.ondataavailable = (e) => e.data.size > 0 && clipChunks.push(e.data);
+        clipRecorder.onstop = () => {
+          const type = clipRecorder?.mimeType || mime || 'video/webm';
+          downloadBlob(new Blob(clipChunks, { type }), `azad-replay-${fileStamp()}.${fileExt(type)}`);
+          showToast('Replay clip saved to your downloads');
+        };
+        clipRecorder.start(500);
+      } catch (err) {
+        console.warn('Could not record replay clip:', err);
+      }
+    }
+  };
+  const handleReplayRef = useRef(handleReplay);
+  handleReplayRef.current = handleReplay;
+
+  const handleStopReplay = () => compositorRef.current?.stopReplay();
+
+  // Poll replay progress + buffered footage for the controls
+  useEffect(() => {
+    const id = setInterval(() => {
+      const status = compositorRef.current?.getReplayStatus();
+      if (status) {
+        setReplayStatus((prev) =>
+          prev.active === status.active && Math.abs(prev.progress - status.progress) < 0.01 ? prev : status
+        );
+      }
+      const secs = Math.floor(replayBufferRef.current?.bufferedSeconds || 0);
+      setBufferedSeconds((prev) => (prev === secs ? prev : secs));
+    }, 250);
+    return () => clearInterval(id);
+  }, []);
+
+  // Pause buffering while the camera is off (keeps memory flat in simulator mode)
+  useEffect(() => {
+    replayBufferRef.current?.setPaused(!isCameraActive);
+  }, [isCameraActive]);
+
+  useEffect(() => {
+    localStorage.setItem('azad_auto_replay', autoReplay ? 'on' : 'off');
+  }, [autoReplay]);
+
+  // Auto replay after a FOUR, SIX or WICKET (after the event graphic has played)
+  const latestBall = activeMatch?.innings[activeMatch.currentInningsIndex]?.deliveries.slice(-1)[0];
+  const lastAutoBallIdRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const id = latestBall?.id ?? null;
+    if (lastAutoBallIdRef.current === undefined || id === lastAutoBallIdRef.current) {
+      lastAutoBallIdRef.current = id; // ignore the ball that was already there when the studio opened
+      return;
+    }
+    lastAutoBallIdRef.current = id;
+    if (!autoReplay || !latestBall) return;
+    const kind = latestBall.isWicket
+      ? 'WICKET'
+      : latestBall.runsBat === 6 || latestBall.isBoundarySix
+      ? 'SIX'
+      : latestBall.runsBat === 4 || latestBall.isBoundaryFour
+      ? 'FOUR'
+      : null;
+    if (!kind) return;
+    const who = latestBall.isWicket ? latestBall.dismissal?.playerOutName || latestBall.strikerName : latestBall.strikerName;
+    const timer = setTimeout(
+      () => handleReplayRef.current(10, { speed: 0.5, caption: `${kind} • ${who}`, auto: true }),
+      4800
+    );
+    return () => clearTimeout(timer);
+  }, [latestBall?.id, autoReplay]);
+
+  // Record the full broadcast output (video + mic) to files on this device, split every 15 minutes
+  const startRecording = () => {
+    const compositor = compositorRef.current;
+    if (!compositor || typeof MediaRecorder === 'undefined') {
+      showToast('Recording is not supported in this browser.');
+      return;
+    }
+    const mime = pickRecorderMime();
+    const audioTracks = mediaStreamRef.current?.getAudioTracks() ?? [];
+    const stream = new MediaStream([...compositor.getStream().getVideoTracks(), ...audioTracks]);
+
+    const startPart = () => {
+      const chunks: Blob[] = [];
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 2_000_000 } : undefined);
+      rec.ondataavailable = (e) => e.data.size > 0 && chunks.push(e.data);
+      rec.onstop = () => {
+        const type = rec.mimeType || mime || 'video/webm';
+        downloadBlob(new Blob(chunks, { type }), `azad-match-${fileStamp()}-part${recordPartRef.current}.${fileExt(type)}`);
+        recordPartRef.current += 1;
+        if (recordContinueRef.current) startPart();
+      };
+      rec.start(2000);
+      recordRecorderRef.current = rec;
+    };
+
+    recordContinueRef.current = true;
+    recordPartRef.current = 1;
+    startPart();
+    recordSplitTimerRef.current = setInterval(() => recordRecorderRef.current?.stop(), 15 * 60 * 1000);
+    setIsRecording(true);
+    setRecordStartedAt(Date.now());
+    requestWakeLock();
+    showToast('Recording started. Files save automatically every 15 minutes.');
+  };
+
+  const stopRecording = () => {
+    recordContinueRef.current = false;
+    clearInterval(recordSplitTimerRef.current);
+    if (recordRecorderRef.current && recordRecorderRef.current.state !== 'inactive') {
+      recordRecorderRef.current.stop();
+    }
+    recordRecorderRef.current = null;
+    setIsRecording(false);
+    setRecordStartedAt(null);
+    if (!isStreaming) releaseWakeLock();
+    showToast('Recording saved to your downloads');
+  };
+
+  useEffect(() => {
+    if (!isRecording || !recordStartedAt) {
+      setRecordElapsed('00:00');
+      return;
+    }
+    const id = setInterval(() => {
+      const diff = Math.floor((Date.now() - recordStartedAt) / 1000);
+      const m = String(Math.floor(diff / 60)).padStart(2, '0');
+      const sec = String(diff % 60).padStart(2, '0');
+      setRecordElapsed(`${m}:${sec}`);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isRecording, recordStartedAt]);
+
+  // Stop recording if the studio closes
+  useEffect(() => {
+    return () => {
+      recordContinueRef.current = false;
+      clearInterval(recordSplitTimerRef.current);
+      if (recordRecorderRef.current && recordRecorderRef.current.state !== 'inactive') recordRecorderRef.current.stop();
+    };
+  }, []);
+
+  // Does this deployment support relaying to YouTube?
+  useEffect(() => {
+    fetch('/api/stream/capabilities')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setRelayAvailable(d ? Boolean(d.youtubeRelay) : false))
+      .catch(() => setRelayAvailable(false));
+  }, []);
+
+  const overlayLinks = selectedMatchId
+    ? [
+        { key: 'lower_third', label: 'Scoreboard (lower third)', url: `${window.location.origin}?obs=true&matchId=${selectedMatchId}&theme=lower_third` },
+        { key: 'event_animation', label: '4 / 6 / Wicket animations', url: `${window.location.origin}?obs=true&matchId=${selectedMatchId}&theme=event_animation` },
+        { key: 'scorecard', label: 'Full scorecard', url: `${window.location.origin}?obs=true&matchId=${selectedMatchId}&theme=scorecard` },
+      ]
+    : [];
+
+  const copyOverlay = (key: string, url: string) => {
+    navigator.clipboard.writeText(url);
+    setCopiedOverlay(key);
+    setTimeout(() => setCopiedOverlay(null), 2000);
+  };
+
   return (
     <div className="fixed inset-0 z-50 bg-ink-950/60 flex flex-col font-sans overflow-hidden select-none">
-      {/* Top Studio Broadcast Bar */}
-      <div className="bg-ink-850 border-b border-white/[0.06] px-4 py-2.5 flex items-center justify-between gap-3 flex-shrink-0">
-        <div className="flex items-center space-x-3">
-          <div className="flex items-center space-x-1.5 px-3 py-1 bg-ink-950/60 rounded-lg border border-amber-500/40">
-            <Radio
-              className={`w-4 h-4 ${
-                isStreaming ? 'text-red-500 animate-pulse' : 'text-amber-400'
-              }`}
-            />
+      {/* Top Studio Broadcast Bar (compact on phones) */}
+      <div className="pt-safe bg-ink-850 border-b border-white/[0.06] flex-shrink-0">
+        <div className="px-3 sm:px-4 h-14 flex items-center gap-2 sm:gap-3">
+          <div className="hidden md:flex items-center space-x-1.5 px-3 py-1 bg-ink-950/60 rounded-lg border border-amber-500/40 shrink-0">
+            <Radio className={`w-4 h-4 ${isStreaming ? 'text-red-500 animate-pulse' : 'text-amber-400'}`} />
             <span className="font-black text-xs text-amber-400 tracking-wider">
               AZAD <span className="text-red-500">LIVE</span> STUDIO
             </span>
@@ -937,9 +1202,13 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
 
           {/* Status pill */}
           <div
-            className={`px-2.5 py-1 rounded-full text-xs font-bold flex items-center space-x-1.5 ${
+            className={`shrink-0 px-2.5 py-1 rounded-full text-[11px] font-bold flex items-center gap-1.5 ${
               isStreaming
-                ? 'bg-red-500/20 text-red-400 border border-red-500/40 animate-pulse'
+                ? 'bg-red-500/20 text-red-400 border border-red-500/40'
+                : replayStatus.active
+                ? 'bg-pulse-500/20 text-pulse-400 border border-pulse-500/40'
+                : isRecording
+                ? 'bg-red-500/15 text-red-300 border border-red-500/30'
                 : isConnecting
                 ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
                 : 'bg-white/[0.05] text-slate-300'
@@ -947,73 +1216,88 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
           >
             <span
               className={`w-2 h-2 rounded-full ${
-                isStreaming ? 'bg-red-500' : isConnecting ? 'bg-amber-400' : 'bg-slate-500'
+                isStreaming || isRecording
+                  ? 'bg-red-500 animate-pulse'
+                  : replayStatus.active
+                  ? 'bg-pulse-400'
+                  : isConnecting
+                  ? 'bg-amber-400'
+                  : 'bg-slate-500'
               }`}
             />
-            <span>{isStreaming ? `LIVE ${liveDuration}` : isConnecting ? 'CONNECTING...' : 'PREVIEW'}</span>
+            <span>
+              {isStreaming
+                ? `LIVE ${liveDuration}`
+                : replayStatus.active
+                ? 'REPLAY'
+                : isRecording
+                ? `REC ${recordElapsed}`
+                : isConnecting
+                ? 'CONNECTING'
+                : 'PREVIEW'}
+            </span>
           </div>
 
-          {/* Wake Lock Active Indicator */}
           {isWakeLockActive && (
             <span
-              className="hidden sm:inline-flex items-center space-x-1 text-[11px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-700/50 px-2 py-0.5 rounded"
-              title="Mobile screen will stay on and not sleep during broadcast"
+              className="hidden sm:inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-700/50 px-2 py-0.5 rounded shrink-0"
+              title="Screen will stay on during the broadcast"
             >
-              <ShieldCheck className="w-3 h-3 text-emerald-400" />
-              <span>Awake</span>
+              <ShieldCheck className="w-3 h-3" />
+              Awake
             </span>
           )}
-        </div>
 
-        {/* Center: Match Selector dropdown */}
-        <div className="flex items-center space-x-2">
+          {/* Match selector */}
           <select
             value={selectedMatchId}
             onChange={(e) => setSelectedMatchId(e.target.value)}
-            disabled={isStreaming}
-            className="bg-ink-950/60 border border-white/10 rounded-lg px-2.5 py-1 text-xs text-white font-medium max-w-[200px] sm:max-w-xs truncate focus:outline-none focus:border-amber-400"
+            disabled={isStreaming || isRecording}
+            aria-label="Match"
+            className="min-w-0 flex-1 bg-ink-950/60 border border-white/10 rounded-lg px-2.5 h-9 text-xs text-white font-medium truncate focus:outline-none focus:border-amber-400"
           >
             {Object.values(state.matches).map((m) => (
               <option key={m.id} value={m.id}>
                 {m.status === 'live' ? '🔴 ' : ''}
-                {m.name} ({m.team1.shortName} vs {m.team2.shortName})
+                {m.team1.shortName} vs {m.team2.shortName} · {m.name}
               </option>
             ))}
           </select>
-        </div>
 
-        {/* Right: Logos, Settings & Exit */}
-        <div className="flex items-center space-x-2">
           <button
             onClick={() => setIsLogosModalOpen(true)}
-            className="px-2.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-bold flex items-center space-x-1.5 transition-colors"
-            title="Upload and manage custom tournament, team & sponsor logos"
+            className="shrink-0 h-9 px-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-xs font-bold flex items-center gap-1.5"
+            title="Logos & branding"
+            aria-label="Logos and branding"
           >
             <Sparkles className="w-4 h-4 text-amber-400" />
-            <span className="hidden sm:inline">Logos &amp; Branding</span>
+            <span className="hidden lg:inline">Logos &amp; Branding</span>
           </button>
 
           <button
             onClick={() => setIsSettingsOpen(!isSettingsOpen)}
-            className="p-1.5 rounded-lg bg-white/[0.05] hover:bg-white/10 text-slate-300 transition-colors"
-            title="Studio Settings"
+            className="shrink-0 h-9 w-9 grid place-items-center rounded-lg bg-white/[0.05] hover:bg-white/10 text-slate-300"
+            title="Studio settings"
+            aria-label="Studio settings"
           >
             <Settings className="w-4 h-4" />
           </button>
           {onClose && (
             <button
               onClick={() => {
-                if (isStreaming) {
-                  if (confirm('A live broadcast is running. Ending broadcast and exiting studio?')) {
-                    handleEndLive();
+                if (isStreaming || isRecording) {
+                  if (confirm('A broadcast or recording is running. Stop it and exit the studio?')) {
+                    if (isRecording) stopRecording();
+                    if (isStreaming) handleEndLive();
                     onClose();
                   }
                 } else {
                   onClose();
                 }
               }}
-              className="p-1.5 rounded-lg bg-white/[0.05] hover:bg-red-900/60 text-slate-400 hover:text-white transition-colors"
-              title="Close Studio"
+              className="shrink-0 h-9 w-9 grid place-items-center rounded-lg bg-white/[0.05] hover:bg-red-900/60 text-slate-400 hover:text-white"
+              title="Close studio"
+              aria-label="Close studio"
             >
               <X className="w-4 h-4" />
             </button>
@@ -1247,7 +1531,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
           </div>
         </div>
 
-        {/* Overlay Test Trigger Buttons (Scorer/Broadcaster testing bar) */}
+        {/* Camera status pill (top-left) */}
         <div className="absolute top-4 left-4 z-20 flex flex-wrap items-center gap-2">
           {/* Re-open Camera Diagnostics Pill when card was dismissed */}
           {isBannerDismissed && !isCameraActive && (
@@ -1261,24 +1545,6 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
             </button>
           )}
 
-          <button
-            onClick={() => compositorRef.current?.triggerEvent('boundary_four')}
-            className="px-2.5 py-1 rounded bg-blue-950/80 border border-blue-700/60 hover:border-blue-400 text-[11px] font-bold text-blue-300 backdrop-blur-md transition-all shadow"
-          >
-            Test 4
-          </button>
-          <button
-            onClick={() => compositorRef.current?.triggerEvent('boundary_six')}
-            className="px-2.5 py-1 rounded bg-amber-950/80 border border-amber-700/60 hover:border-amber-400 text-[11px] font-bold text-amber-300 backdrop-blur-md transition-all shadow"
-          >
-            Test 6
-          </button>
-          <button
-            onClick={() => compositorRef.current?.triggerEvent('wicket')}
-            className="px-2.5 py-1 rounded bg-red-950/80 border border-red-700/60 hover:border-red-400 text-[11px] font-bold text-red-300 backdrop-blur-md transition-all shadow"
-          >
-            Test Wicket
-          </button>
         </div>
 
         {/* YouTube Watch URL Banner (when live or configured) */}
@@ -1313,66 +1579,247 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
         )}
       </div>
 
-      {/* Bottom Main Action Bar (Large touch targets for Mobile Broadcaster) */}
-      <div className="bg-ink-850 border-t border-white/[0.06] p-3 sm:p-4 z-30 flex-shrink-0">
-        <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          {/* Health & Bitrate Indicators */}
-          <div className="flex items-center space-x-3 text-xs w-full sm:w-auto justify-between sm:justify-start">
-            <div className="flex items-center space-x-1.5">
-              <Wifi
-                className={`w-3.5 h-3.5 ${
-                  streamHealth === 'excellent'
-                    ? 'text-emerald-400'
-                    : streamHealth === 'good'
-                    ? 'text-cyan-400'
-                    : streamHealth === 'fair'
-                    ? 'text-amber-400'
-                    : 'text-red-500 animate-pulse'
-                }`}
-              />
-              <span className="text-slate-400 capitalize">Health: <strong className="text-white">{streamHealth}</strong></span>
-            </div>
+      {/* Toast */}
+      {toast && (
+        <div className="pointer-events-none absolute left-1/2 -translate-x-1/2 bottom-48 sm:bottom-40 z-40 max-w-[90vw] px-4 py-2 rounded-full bg-ink-950/90 border border-white/10 text-xs font-semibold text-white shadow-2xl backdrop-blur">
+          {toast}
+        </div>
+      )}
 
-            <div className="text-slate-400">
-              Bitrate: <strong className="text-white font-mono">{uploadBitrateKbps} kbps</strong>
-            </div>
-
-            <div className="text-slate-400">
-              Preset: <strong className="text-amber-400 uppercase font-mono">{qualityPreset}</strong>
-            </div>
+      {/* Bottom controls: instant replay dock + record / go live (large touch targets) */}
+      <div className="bg-ink-850 border-t border-white/[0.06] z-30 flex-shrink-0 pb-safe">
+        {/* Replay dock */}
+        <div className="px-3 sm:px-4 pt-3">
+          <div className="max-w-4xl mx-auto">
+            {replayStatus.active ? (
+              <div className="flex items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between text-[11px] font-bold mb-1">
+                    <span className="text-pulse-400 flex items-center gap-1.5">
+                      <Rewind className="w-3.5 h-3.5" />
+                      {replayStatus.speed < 1 ? `SLOW-MO REPLAY ${replayStatus.speed}x` : 'REPLAY'} ON AIR
+                    </span>
+                    <span className="text-slate-500">{Math.round(replayStatus.progress * 100)}%</span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-brand-400 to-pulse-500 transition-[width] duration-200"
+                      style={{ width: `${replayStatus.progress * 100}%` }}
+                    />
+                  </div>
+                </div>
+                <button
+                  onClick={handleStopReplay}
+                  className="shrink-0 h-11 px-4 rounded-xl bg-white text-ink-950 font-black text-xs flex items-center gap-1.5 active:scale-95"
+                >
+                  <Radio className="w-4 h-4" /> Back to live
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 overflow-x-auto scrollbar-none -mx-1 px-1">
+                <span className="shrink-0 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-slate-500 pr-1">
+                  <Rewind className="w-3.5 h-3.5" /> Replay
+                </span>
+                {[10, 20, 30].map((secs) => {
+                  const ready = isCameraActive && bufferedSeconds >= Math.min(secs, 5);
+                  return (
+                    <button
+                      key={secs}
+                      onClick={() => handleReplay(secs)}
+                      disabled={!isCameraActive}
+                      className={`shrink-0 h-11 min-w-[64px] px-3 rounded-xl font-black text-sm border transition-all active:scale-95 ${
+                        ready
+                          ? 'bg-gradient-to-br from-brand-500/25 to-pulse-500/25 border-brand-400/50 text-white'
+                          : 'bg-white/[0.03] border-white/[0.06] text-slate-500'
+                      }`}
+                      title={`Replay the last ${secs} seconds`}
+                    >
+                      {secs}s
+                    </button>
+                  );
+                })}
+                <button
+                  onClick={() => setSlowMo((v) => !v)}
+                  className={`shrink-0 h-11 px-3 rounded-xl text-xs font-bold border flex items-center gap-1.5 active:scale-95 ${
+                    slowMo ? 'bg-trophy-500/20 border-trophy-400/60 text-trophy-300' : 'bg-white/[0.03] border-white/[0.08] text-slate-300'
+                  }`}
+                  aria-pressed={slowMo}
+                  title="Play replays in slow motion (0.5x)"
+                >
+                  <Gauge className="w-4 h-4" /> Slow-mo
+                </button>
+                <button
+                  onClick={() => setAutoReplay((v) => !v)}
+                  className={`shrink-0 h-11 px-3 rounded-xl text-xs font-bold border flex items-center gap-1.5 active:scale-95 ${
+                    autoReplay ? 'bg-pitch-500/15 border-pitch-500/50 text-pitch-400' : 'bg-white/[0.03] border-white/[0.08] text-slate-300'
+                  }`}
+                  aria-pressed={autoReplay}
+                  title="Automatically replay 4s, 6s and wickets in slow motion"
+                >
+                  <Sparkles className="w-4 h-4" /> Auto 4·6·W
+                </button>
+                <button
+                  onClick={() => setSaveReplayClips((v) => !v)}
+                  className={`shrink-0 h-11 px-3 rounded-xl text-xs font-bold border flex items-center gap-1.5 active:scale-95 ${
+                    saveReplayClips ? 'bg-brand-500/15 border-brand-400/50 text-brand-300' : 'bg-white/[0.03] border-white/[0.08] text-slate-300'
+                  }`}
+                  aria-pressed={saveReplayClips}
+                  title="Save each replay as a video clip on this device"
+                >
+                  <Download className="w-4 h-4" /> Save clips
+                </button>
+                <span className="shrink-0 text-[10px] text-slate-500 font-mono pl-1">
+                  {isCameraActive ? `${bufferedSeconds}s buffered` : 'camera off'}
+                </span>
+              </div>
+            )}
           </div>
+        </div>
 
-          {/* Big Broadcast Button */}
-          <div className="flex items-center space-x-3 w-full sm:w-auto justify-end">
+        {/* Record + Go live */}
+        <div className="p-3 sm:px-4">
+          <div className="max-w-4xl mx-auto flex items-center gap-2 sm:gap-3">
+            {isStreaming && (
+              <div className="hidden sm:flex items-center gap-3 text-xs mr-auto">
+                <span className="flex items-center gap-1.5 text-slate-400">
+                  <Wifi
+                    className={`w-3.5 h-3.5 ${
+                      streamHealth === 'excellent'
+                        ? 'text-emerald-400'
+                        : streamHealth === 'good'
+                        ? 'text-cyan-400'
+                        : streamHealth === 'fair'
+                        ? 'text-amber-400'
+                        : 'text-red-500 animate-pulse'
+                    }`}
+                  />
+                  <strong className="text-white capitalize">{streamHealth}</strong>
+                </span>
+                <span className="text-slate-400">
+                  <strong className="text-white font-mono">{uploadBitrateKbps}</strong> kbps
+                </span>
+                <span className="text-amber-400 uppercase font-mono font-bold">{qualityPreset}</span>
+              </div>
+            )}
+
+            <button
+              onClick={isRecording ? stopRecording : startRecording}
+              className={`h-12 px-4 rounded-xl font-black text-xs sm:text-sm flex items-center justify-center gap-2 border active:scale-95 transition-all ${
+                isRecording
+                  ? 'bg-red-600/20 border-red-500/60 text-red-300'
+                  : 'bg-white/[0.04] border-white/10 text-white hover:bg-white/[0.08]'
+              }`}
+              title={isRecording ? 'Stop recording and save' : 'Record the broadcast to this device'}
+            >
+              {isRecording ? <Square className="w-4 h-4 fill-red-500 text-red-500" /> : <Circle className="w-4 h-4 fill-red-500 text-red-500" />}
+              <span>{isRecording ? `Stop ${recordElapsed}` : 'Record'}</span>
+            </button>
+
             {!isStreaming ? (
               <button
                 onClick={handleStartLive}
                 disabled={isConnecting}
-                className={`flex-1 sm:flex-none px-8 py-3 rounded-xl font-black text-sm tracking-wide shadow-xl flex items-center justify-center space-x-2 transition-all ${
+                className={`flex-1 sm:flex-none sm:ml-auto h-12 px-6 rounded-xl font-black text-sm tracking-wide shadow-xl flex items-center justify-center gap-2 active:scale-[0.98] transition-all ${
                   isConnecting
                     ? 'bg-amber-600/80 text-white cursor-wait'
-                    : 'bg-gradient-to-r from-red-600 via-rose-600 to-amber-600 hover:from-red-500 hover:to-amber-500 text-white shadow-red-950/50 hover:shadow-red-900/60 animate-pulse'
+                    : 'bg-gradient-to-r from-red-600 via-rose-600 to-amber-600 hover:brightness-110 text-white shadow-red-950/50'
                 }`}
               >
-                <Radio className="w-5 h-5 fill-white" />
-                <span>{isConnecting ? 'CONNECTING TO YOUTUBE...' : 'START LIVE BROADCAST'}</span>
+                <Radio className="w-5 h-5" />
+                <span>{isConnecting ? 'CONNECTING…' : 'GO LIVE'}</span>
               </button>
             ) : (
               <button
                 onClick={handleEndLive}
-                className="flex-1 sm:flex-none px-8 py-3 rounded-xl font-black text-sm tracking-wide bg-gradient-to-r from-red-700 to-ink-850 hover:from-red-600 text-white border border-red-500/40 shadow-xl flex items-center justify-center space-x-2 transition-all"
+                className="flex-1 sm:flex-none sm:ml-auto h-12 px-6 rounded-xl font-black text-sm tracking-wide bg-gradient-to-r from-red-700 to-ink-850 text-white border border-red-500/40 shadow-xl flex items-center justify-center gap-2 active:scale-[0.98]"
               >
                 <Square className="w-5 h-5 fill-red-500 text-red-500" />
-                <span>END LIVE BROADCAST</span>
+                <span>END LIVE</span>
               </button>
             )}
           </div>
         </div>
       </div>
 
+      {/* "Go live with a streaming app" guide (used when this deployment can't relay to YouTube) */}
+      {isGoLiveGuideOpen && (
+        <div className="absolute inset-0 z-[60] flex items-end sm:items-center justify-center">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setIsGoLiveGuideOpen(false)} />
+          <div className="relative w-full sm:max-w-lg max-h-[88dvh] flex flex-col rounded-t-3xl sm:rounded-3xl bg-ink-850 border border-white/10 shadow-2xl pb-safe">
+            <div className="shrink-0 px-5 pt-4 pb-3 border-b border-white/[0.06] flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-400">Go live on YouTube</div>
+                <h3 className="font-display text-2xl font-semibold text-white leading-tight mt-0.5">Stream with a streaming app</h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  This server can’t send video to YouTube directly. Use a free streaming app and add AZAD LIVE’s live
+                  scoreboard to it with the links below. Scores update automatically.
+                </p>
+              </div>
+              <button onClick={() => setIsGoLiveGuideOpen(false)} className="p-2 rounded-full bg-white/5 shrink-0" aria-label="Close">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-5 py-4 space-y-5">
+              <div className="space-y-2">
+                <div className="text-xs font-bold text-white">1. Copy an overlay link for this match</div>
+                {overlayLinks.length === 0 ? (
+                  <p className="text-xs text-slate-500">Pick a match at the top first.</p>
+                ) : (
+                  overlayLinks.map((o) => (
+                    <div key={o.key} className="flex items-center gap-2 p-2.5 rounded-xl bg-ink-950/60 border border-white/[0.06]">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-xs font-semibold text-slate-200">{o.label}</div>
+                        <div className="text-[10px] text-slate-500 font-mono truncate">{o.url}</div>
+                      </div>
+                      <button
+                        onClick={() => copyOverlay(o.key, o.url)}
+                        className="shrink-0 h-9 px-3 rounded-lg bg-amber-500 text-black text-xs font-bold flex items-center gap-1"
+                      >
+                        {copiedOverlay === o.key ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                        {copiedOverlay === o.key ? 'Copied' : 'Copy'}
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="grid gap-3">
+                <div className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                  <div className="flex items-center gap-2 text-xs font-bold text-white">
+                    <Smartphone className="w-4 h-4 text-brand-300" /> From a phone
+                  </div>
+                  <ol className="mt-2 space-y-1 text-[11px] text-slate-400 list-decimal pl-4">
+                    <li>Install a streaming app that supports web overlays (for example PRISM Live Studio).</li>
+                    <li>Sign in with the YouTube channel and create a live stream.</li>
+                    <li>Add a <strong className="text-slate-200">Web / Browser widget</strong> and paste the scoreboard link.</li>
+                    <li>Go live from the app. Keep scoring in AZAD LIVE on another phone.</li>
+                  </ol>
+                </div>
+                <div className="p-3 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                  <div className="flex items-center gap-2 text-xs font-bold text-white">
+                    <Monitor className="w-4 h-4 text-pulse-400" /> From a laptop (OBS)
+                  </div>
+                  <ol className="mt-2 space-y-1 text-[11px] text-slate-400 list-decimal pl-4">
+                    <li>In OBS, add your camera, then <strong className="text-slate-200">+ Browser</strong> source.</li>
+                    <li>Paste the link, set size to 1920 × 1080.</li>
+                    <li>Settings → Stream → YouTube, then Start Streaming.</li>
+                  </ol>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-slate-500">
+                Tip: this studio still works for <strong className="text-slate-300">instant replays</strong> and{' '}
+                <strong className="text-slate-300">recording</strong> on this phone, with the scoreboard burned into the video.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Settings Drawer / Slide-Over Modal */}
       {isSettingsOpen && (
-        <div className="absolute inset-y-0 right-0 w-full sm:w-96 bg-ink-850 border-l border-white/[0.06] z-50 p-5 overflow-y-auto space-y-6 shadow-2xl">
+        <div className="absolute inset-y-0 right-0 w-full sm:w-96 bg-ink-850 border-l border-white/[0.06] z-50 p-5 pt-[max(1.25rem,env(safe-area-inset-top))] pb-[max(1.25rem,env(safe-area-inset-bottom))] overflow-y-auto overscroll-contain space-y-6 shadow-2xl">
           <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
             <h3 className="font-black text-white text-base flex items-center space-x-2">
               <Settings className="w-5 h-5 text-amber-400" />
@@ -1508,6 +1955,31 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
                 className="w-4 h-4 accent-amber-500 rounded"
               />
             </label>
+          </div>
+
+          {/* Test the on-screen graphics */}
+          <div className="space-y-2">
+            <label className="text-xs font-bold text-slate-300 block">Test graphics</label>
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                onClick={() => compositorRef.current?.triggerEvent('boundary_four')}
+                className="h-10 rounded-lg bg-blue-950/80 border border-blue-700/60 text-xs font-bold text-blue-300"
+              >
+                Four
+              </button>
+              <button
+                onClick={() => compositorRef.current?.triggerEvent('boundary_six')}
+                className="h-10 rounded-lg bg-amber-950/80 border border-amber-700/60 text-xs font-bold text-amber-300"
+              >
+                Six
+              </button>
+              <button
+                onClick={() => compositorRef.current?.triggerEvent('wicket')}
+                className="h-10 rounded-lg bg-red-950/80 border border-red-700/60 text-xs font-bold text-red-300"
+              >
+                Wicket
+              </button>
+            </div>
           </div>
 
           {/* Mobile Screen Guidance */}
