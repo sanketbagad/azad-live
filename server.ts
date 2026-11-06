@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
 import path from 'path';
@@ -5,6 +6,7 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
+import crypto from 'crypto';
 import { initializeApp as initializeAdminApp, cert, ServiceAccount } from 'firebase-admin/app';
 import { getAuth as getAdminAuth, DecodedIdToken } from 'firebase-admin/auth';
 import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
@@ -80,6 +82,41 @@ const adminApp = initializeAdminApp(
 );
 const adminAuth = getAdminAuth(adminApp);
 const adminDb = getAdminFirestore(adminApp);
+
+// ==========================================
+// LIVEKIT (in-app live video)
+// ==========================================
+// Set LIVEKIT_URL (wss://<project>.livekit.cloud), LIVEKIT_API_KEY and LIVEKIT_API_SECRET.
+// Tokens are signed here with HMAC-SHA256 (the format LiveKit expects), no SDK needed.
+const LIVEKIT_URL = (process.env.LIVEKIT_URL || '').trim();
+const LIVEKIT_API_KEY = (process.env.LIVEKIT_API_KEY || '').trim();
+const LIVEKIT_API_SECRET = (process.env.LIVEKIT_API_SECRET || '').trim();
+const LIVEKIT_ENABLED = Boolean(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET);
+
+interface LiveKitVideoGrant {
+  room: string;
+  roomJoin: boolean;
+  canPublish: boolean;
+  canSubscribe: boolean;
+  canPublishData: boolean;
+}
+
+function createLiveKitToken(identity: string, name: string, grant: LiveKitVideoGrant, ttlSeconds: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const b64url = (obj: object) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const header = b64url({ alg: 'HS256', typ: 'JWT' });
+  const payload = b64url({
+    iss: LIVEKIT_API_KEY,
+    sub: identity,
+    jti: identity,
+    name,
+    nbf: now - 10,
+    exp: now + ttlSeconds,
+    video: grant,
+  });
+  const signature = crypto.createHmac('sha256', LIVEKIT_API_SECRET).update(`${header}.${payload}`).digest('base64url');
+  return `${header}.${payload}.${signature}`;
+}
 
 // Seeded demo accounts from the old email/password system. Their emails are on domains we don't
 // control, so anyone owning those domains could claim them via Google sign-in.
@@ -432,10 +469,12 @@ export async function createApp() {
     next();
   });
 
-  // Lets the studio know whether "Go Live to YouTube" can run here (needs ffmpeg on a long-running server)
+  // Lets the studio know what it can do here: YouTube relay (needs ffmpeg on a long-running
+  // server) and/or in-app live video (needs LiveKit credentials)
   app.get('/api/stream/capabilities', (req: Request, res: Response) => {
-    res.json({ youtubeRelay: !IS_SERVERLESS });
+    res.json({ youtubeRelay: !IS_SERVERLESS, inAppVideo: LIVEKIT_ENABLED });
   });
+
 
   // Live streaming relays video through ffmpeg in a long-running process: not possible on serverless
   if (IS_SERVERLESS) {
@@ -490,6 +529,67 @@ export async function createApp() {
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     if (req.method === 'GET' || req.path.startsWith('/stream/chunk')) return next();
     return writeLimiter(req, res, next);
+  });
+
+  // ==========================================
+  // IN-APP LIVE VIDEO (LiveKit)
+  // ==========================================
+
+  // Access token for a match's video room. Broadcasting requires admin or the match's scorer;
+  // watching is public (same as the live score).
+  app.post('/api/live-video/token', async (req: Request, res: Response) => {
+    if (!LIVEKIT_ENABLED) {
+      return res.status(503).json({ error: 'In-app live video is not configured on this server.' });
+    }
+    const matchId = String(req.body?.matchId || '');
+    const role = req.body?.role === 'publisher' ? 'publisher' : 'viewer';
+    const match = dbState.matches[matchId];
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    const room = `match_${matchId}`;
+
+    if (role === 'publisher') {
+      const user = await getAuthUser(req);
+      if (!user) return res.status(401).json({ error: 'Please sign in with Google to broadcast.' });
+      if (!canScoreMatch(user, matchId)) {
+        return res.status(403).json({ error: 'Only admins and this match’s scorers can broadcast it.' });
+      }
+      const token = createLiveKitToken(`broadcaster_${user.id}`, user.name, {
+        room,
+        roomJoin: true,
+        canPublish: true,
+        canSubscribe: false,
+        canPublishData: true,
+      }, 6 * 3600);
+      return res.json({ url: LIVEKIT_URL, token, room });
+    }
+
+    const viewerId = `viewer_${Math.random().toString(36).slice(2, 10)}`;
+    const token = createLiveKitToken(viewerId, 'Viewer', {
+      room,
+      roomJoin: true,
+      canPublish: false,
+      canSubscribe: true,
+      canPublishData: false,
+    }, 4 * 3600);
+    res.json({ url: LIVEKIT_URL, token, room });
+  });
+
+  // Broadcaster marks the match as live on video (and refreshes it every minute as a heartbeat)
+  app.post('/api/matches/:id/live-video', requireMatchScorer(), (req: Request, res: Response) => {
+    const match = dbState.matches[req.params.id];
+    const now = Date.now();
+    if (req.body?.active) {
+      match.liveVideo = {
+        active: true,
+        startedAt: match.liveVideo?.active ? match.liveVideo.startedAt : now,
+        lastSeen: now,
+        startedByName: res.locals.user?.name,
+      };
+    } else {
+      match.liveVideo = match.liveVideo ? { ...match.liveVideo, active: false, lastSeen: now } : undefined;
+    }
+    broadcastStateUpdate();
+    res.json({ liveVideo: match.liveVideo ?? null });
   });
 
   // SSE Real-Time Sync Endpoint (Public). Not available on serverless: browsers listen to

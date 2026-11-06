@@ -3,6 +3,7 @@ import { useCricket } from '../../context/CricketContext';
 import { Match, StreamQualityPreset, StreamHealthStatus, CustomStreamLogos } from '../../types/cricket';
 import { createVideoCompositor, CompositorController, ReplayStatus } from '../../services/videoCompositor';
 import { ReplayBuffer } from '../../services/replayBuffer';
+import { Room, RoomEvent, Track } from 'livekit-client';
 import {
   Video,
   VideoOff,
@@ -454,6 +455,14 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
   // null = unknown yet; false = this deployment can't relay to YouTube (e.g. Vercel)
   const [relayAvailable, setRelayAvailable] = useState<boolean | null>(null);
   const [isGoLiveGuideOpen, setIsGoLiveGuideOpen] = useState(false);
+  const [inAppVideoAvailable, setInAppVideoAvailable] = useState<boolean | null>(null);
+  const [isGoLiveChooserOpen, setIsGoLiveChooserOpen] = useState(false);
+  // Where the current broadcast goes
+  const [streamTarget, setStreamTarget] = useState<'app' | 'youtube' | null>(null);
+  const [liveViewerCount, setLiveViewerCount] = useState(0);
+  const liveRoomRef = useRef<Room | null>(null);
+  const liveHeartbeatRef = useRef<any>(null);
+  const liveMatchIdRef = useRef<string | null>(null);
   const [copiedOverlay, setCopiedOverlay] = useState<string | null>(null);
 
   const canBroadcast = Boolean(selectedMatchId) && canScoreMatch(selectedMatchId);
@@ -796,8 +805,143 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
     isUploadingRef.current = false;
   };
 
-  // START LIVE BROADCAST
-  const handleStartLive = async () => {
+  // GO LIVE: choose in-app video (LiveKit) or YouTube
+  const handleStartLive = () => {
+    if (!canBroadcast) {
+      openAuthModal();
+      return;
+    }
+    setIsGoLiveChooserOpen(true);
+  };
+
+  // ---------- In-app live video (LiveKit) ----------
+  const setLiveVideoFlag = async (matchId: string, active: boolean) => {
+    try {
+      await fetch(`/api/matches/${matchId}/live-video`, {
+        method: 'POST',
+        headers: await getAuthHeaders(),
+        body: JSON.stringify({ active }),
+        keepalive: true,
+      });
+    } catch {
+      // the heartbeat retries
+    }
+  };
+
+  const stopInAppLive = async () => {
+    clearInterval(liveHeartbeatRef.current);
+    const room = liveRoomRef.current;
+    liveRoomRef.current = null;
+    if (room) {
+      room.removeAllListeners();
+      await room.disconnect();
+    }
+    if (liveMatchIdRef.current) await setLiveVideoFlag(liveMatchIdRef.current, false);
+    liveMatchIdRef.current = null;
+    setIsStreaming(false);
+    setIsConnecting(false);
+    setStreamTarget(null);
+    setStreamStartTime(null);
+    setLiveViewerCount(0);
+    if (!isRecording) releaseWakeLock();
+    setStatusMessage('Broadcast ended');
+  };
+
+  const startInAppLive = async () => {
+    setIsGoLiveChooserOpen(false);
+    if (!canBroadcast) {
+      openAuthModal();
+      return;
+    }
+    if (!compositorRef.current) initCompositor();
+    const compositor = compositorRef.current;
+    if (!compositor) return;
+
+    setIsConnecting(true);
+    setStatusMessage('Connecting to AZAD LIVE video…');
+    let room: Room | null = null;
+    try {
+      const res = await fetch('/api/live-video/token', {
+        method: 'POST',
+        headers: await getAuthHeaders(),
+        body: JSON.stringify({ matchId: selectedMatchId, role: 'publisher' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not start live video');
+
+      room = new Room({ dynacast: true });
+      const countViewers = () => setLiveViewerCount(room ? room.remoteParticipants.size : 0);
+      room
+        .on(RoomEvent.ParticipantConnected, countViewers)
+        .on(RoomEvent.ParticipantDisconnected, countViewers)
+        .on(RoomEvent.Reconnecting, () => setStreamHealth('reconnecting'))
+        .on(RoomEvent.Reconnected, () => setStreamHealth('good'))
+        .on(RoomEvent.Disconnected, () => {
+          if (liveRoomRef.current === room) {
+            showToast('Live video disconnected');
+            stopInAppLive();
+          }
+        });
+      await room.connect(data.url, data.token);
+
+      // Publish copies of the tracks so ending the broadcast never stops the studio's own output
+      const { bitrate } = getResolutionDimensions(qualityPreset);
+      const videoTrack = compositor.getStream().getVideoTracks()[0];
+      if (!videoTrack) throw new Error('Studio video is not ready yet');
+      await room.localParticipant.publishTrack(videoTrack.clone(), {
+        name: 'broadcast',
+        source: Track.Source.Camera,
+        simulcast: true,
+        videoEncoding: { maxBitrate: bitrate, maxFramerate: 30 },
+      });
+      const mic = mediaStreamRef.current?.getAudioTracks()[0];
+      if (mic) {
+        await room.localParticipant.publishTrack(mic.clone(), { name: 'mic', source: Track.Source.Microphone });
+      }
+
+      liveRoomRef.current = room;
+      liveMatchIdRef.current = selectedMatchId;
+      await setLiveVideoFlag(selectedMatchId, true);
+      liveHeartbeatRef.current = setInterval(() => {
+        if (liveMatchIdRef.current) setLiveVideoFlag(liveMatchIdRef.current, true);
+      }, 60_000);
+
+      countViewers();
+      setStreamTarget('app');
+      setIsStreaming(true);
+      setStreamHealth('good');
+      setStreamStartTime(Date.now());
+      requestWakeLock();
+      setStatusMessage('🔴 LIVE IN THE AZAD LIVE APP');
+    } catch (err: any) {
+      console.error('Failed to start in-app live video:', err);
+      if (room) {
+        room.removeAllListeners();
+        room.disconnect();
+      }
+      showToast(err?.message || 'Could not start live video');
+      setStatusMessage(`Failed to go live: ${err?.message}`);
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  // End the in-app broadcast if the studio closes
+  useEffect(() => {
+    return () => {
+      clearInterval(liveHeartbeatRef.current);
+      if (liveRoomRef.current) {
+        liveRoomRef.current.removeAllListeners();
+        liveRoomRef.current.disconnect();
+        liveRoomRef.current = null;
+      }
+      if (liveMatchIdRef.current) setLiveVideoFlag(liveMatchIdRef.current, false);
+    };
+  }, []);
+
+  // ---------- YouTube (server ffmpeg relay) ----------
+  const handleStartYouTube = async () => {
+    setIsGoLiveChooserOpen(false);
     if (!canBroadcast) {
       openAuthModal();
       return;
@@ -892,6 +1036,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
       };
 
       recorder.onstart = () => {
+        setStreamTarget('youtube');
         setIsStreaming(true);
         setIsConnecting(false);
         setStreamStartTime(Date.now());
@@ -919,8 +1064,12 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
   };
 
   // END LIVE BROADCAST
-  const handleEndLive = async () => {
-    if (!confirm('End this AZAD LIVE broadcast? This will conclude the live stream for all viewers.')) {
+  const handleEndLive = async (skipConfirm = false) => {
+    if (!skipConfirm && !confirm('End this broadcast? Viewers will stop seeing the live video.')) {
+      return;
+    }
+    if (streamTarget === 'app') {
+      await stopInAppLive();
       return;
     }
 
@@ -949,6 +1098,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
 
     setIsStreaming(false);
     setIsConnecting(false);
+    setStreamTarget(null);
     setStreamSessionId(null);
     setStreamStartTime(null);
     releaseWakeLock();
@@ -1170,8 +1320,14 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
   useEffect(() => {
     fetch('/api/stream/capabilities')
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => setRelayAvailable(d ? Boolean(d.youtubeRelay) : false))
-      .catch(() => setRelayAvailable(false));
+      .then((d) => {
+        setRelayAvailable(d ? Boolean(d.youtubeRelay) : false);
+        setInAppVideoAvailable(d ? Boolean(d.inAppVideo) : false);
+      })
+      .catch(() => {
+        setRelayAvailable(false);
+        setInAppVideoAvailable(false);
+      });
   }, []);
 
   const overlayLinks = selectedMatchId
@@ -1238,6 +1394,15 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
             </span>
           </div>
 
+          {isStreaming && streamTarget === 'app' && (
+            <span
+              className="shrink-0 px-2 py-1 rounded-full text-[11px] font-bold bg-white/[0.06] text-white flex items-center gap-1"
+              title="People watching in the app"
+            >
+              <Eye className="w-3.5 h-3.5" /> {liveViewerCount}
+            </span>
+          )}
+
           {isWakeLockActive && (
             <span
               className="hidden sm:inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400 bg-emerald-950/60 border border-emerald-700/50 px-2 py-0.5 rounded shrink-0"
@@ -1288,7 +1453,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
                 if (isStreaming || isRecording) {
                   if (confirm('A broadcast or recording is running. Stop it and exit the studio?')) {
                     if (isRecording) stopRecording();
-                    if (isStreaming) handleEndLive();
+                    if (isStreaming) handleEndLive(true);
                     onClose();
                   }
                 } else {
@@ -1730,7 +1895,7 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
               </button>
             ) : (
               <button
-                onClick={handleEndLive}
+                onClick={() => handleEndLive()}
                 className="flex-1 sm:flex-none sm:ml-auto h-12 px-6 rounded-xl font-black text-sm tracking-wide bg-gradient-to-r from-red-700 to-ink-850 text-white border border-red-500/40 shadow-xl flex items-center justify-center gap-2 active:scale-[0.98]"
               >
                 <Square className="w-5 h-5 fill-red-500 text-red-500" />
@@ -1740,6 +1905,57 @@ export const LiveStreamStudio: React.FC<LiveStreamStudioProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Go Live chooser: in-app video (LiveKit) or YouTube */}
+      {isGoLiveChooserOpen && (
+        <div className="absolute inset-0 z-[60] flex items-end sm:items-center justify-center">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setIsGoLiveChooserOpen(false)} />
+          <div className="relative w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl bg-ink-850 border border-white/10 shadow-2xl pb-safe">
+            <div className="px-5 pt-4 pb-2 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-[0.15em] text-live-400">Go live</div>
+                <h3 className="font-display text-2xl font-semibold text-white leading-tight">Where should viewers watch?</h3>
+              </div>
+              <button onClick={() => setIsGoLiveChooserOpen(false)} className="p-2 rounded-full bg-white/5 shrink-0" aria-label="Close">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-5 pt-3 space-y-3">
+              <button
+                onClick={startInAppLive}
+                disabled={!inAppVideoAvailable}
+                className="w-full text-left p-4 rounded-2xl border bg-gradient-to-br from-live-600/20 to-pulse-600/10 border-live-500/40 disabled:opacity-50 disabled:pointer-events-none active:scale-[0.99]"
+              >
+                <div className="flex items-center gap-2">
+                  <Radio className="w-5 h-5 text-live-400" />
+                  <span className="font-bold text-white">In the AZAD LIVE app</span>
+                  <span className="chip bg-white/10 text-white ml-auto">Recommended</span>
+                </div>
+                <p className="text-xs text-slate-300 mt-1.5">
+                  Viewers watch on the match page, with your scoreboard, instant replays and slow-mo. Low delay, no YouTube needed.
+                </p>
+                {inAppVideoAvailable === false && (
+                  <p className="text-[11px] text-trophy-300 mt-1.5">Not set up yet: add the LiveKit keys to the server.</p>
+                )}
+              </button>
+              <button
+                onClick={handleStartYouTube}
+                className="w-full text-left p-4 rounded-2xl border bg-white/[0.03] border-white/10 active:scale-[0.99]"
+              >
+                <div className="flex items-center gap-2">
+                  <Tv className="w-5 h-5 text-slate-300" />
+                  <span className="font-bold text-white">YouTube</span>
+                </div>
+                <p className="text-xs text-slate-400 mt-1.5">
+                  {relayAvailable
+                    ? 'Stream to your YouTube channel with the stream key from Settings.'
+                    : 'Use a streaming app (PRISM or OBS) with our scoreboard overlay. We’ll show you how.'}
+                </p>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* "Go live with a streaming app" guide (used when this deployment can't relay to YouTube) */}
       {isGoLiveGuideOpen && (

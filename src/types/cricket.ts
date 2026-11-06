@@ -229,8 +229,17 @@ export interface Match {
   result?: MatchResult;
   isDemo?: boolean;
   customLogos?: CustomStreamLogos;
+  /** In-app live video (LiveKit). lastSeen is refreshed by the broadcaster every minute. */
+  liveVideo?: LiveVideoState;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface LiveVideoState {
+  active: boolean;
+  startedAt: number;
+  lastSeen: number;
+  startedByName?: string;
 }
 
 export interface CustomStreamLogos {

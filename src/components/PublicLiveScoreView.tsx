@@ -9,6 +9,7 @@ import { EventFlash } from './live/EventFlash';
 import { MatchReplay, ReplayMode } from './live/MatchReplay';
 import { OversChart } from './live/OversChart';
 import { CommentaryFeed } from './live/CommentaryFeed';
+import { LiveVideoPlayer } from './live/LiveVideoPlayer';
 import { calculateRunRate } from '../utils/cricketEngine';
 import {
   chaseInfo,
@@ -161,6 +162,9 @@ export const PublicLiveScoreView: React.FC<{ stickyTopClass?: string }> = ({ sti
           })}
         </div>
       )}
+
+      {/* ===== Live video (when the match is being broadcast in the app) ===== */}
+      <LiveVideoPlayer key={match.id} match={match} />
 
       {/* ===== Hero scoreboard ===== */}
       <section

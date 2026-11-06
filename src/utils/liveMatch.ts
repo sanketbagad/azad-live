@@ -156,4 +156,10 @@ export function situationText(match: Match): string {
     : `${batting.shortName} batting first`;
 }
 
+/** A broadcast counts as live if the studio's heartbeat was seen in the last 3 minutes. */
+export function isVideoLive(match: Match): boolean {
+  const lv = match.liveVideo;
+  return Boolean(lv?.active && Date.now() - lv.lastSeen < 3 * 60_000);
+}
+
 export { formatOvers };
