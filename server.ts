@@ -18,6 +18,7 @@ import {
   undoLastDelivery,
 } from './src/utils/cricketEngine.js';
 import { createEmptyDatabase } from './src/utils/emptyDatabase.js';
+import { registerAuctionRoutes, PhotoStore } from './src/server/auctionRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -254,6 +255,42 @@ if (!USE_FIRESTORE_STORE) {
   dbState = loadDatabase();
   ensureFoundingAdmin();
 }
+
+// Auction player photos live outside the main database document (it must stay small):
+// Firestore collection on Vercel, files under data/auction_photos locally.
+const safePhotoId = (id: string) => id.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80);
+const PHOTO_DIR = path.resolve(DATA_DIR, 'auction_photos');
+const auctionPhotoStore: PhotoStore = USE_FIRESTORE_STORE
+  ? {
+      async save(id, data, contentType) {
+        await adminDb.collection('auction_photos').doc(safePhotoId(id)).set({ data, contentType, updatedAt: Date.now() });
+      },
+      async load(id) {
+        const snap = await adminDb.collection('auction_photos').doc(safePhotoId(id)).get();
+        if (!snap.exists) return null;
+        return { data: Buffer.from(snap.get('data')), contentType: String(snap.get('contentType') || 'image/jpeg') };
+      },
+      async remove(id) {
+        await adminDb.collection('auction_photos').doc(safePhotoId(id)).delete();
+      },
+    }
+  : {
+      async save(id, data, contentType) {
+        fs.mkdirSync(PHOTO_DIR, { recursive: true });
+        fs.writeFileSync(path.join(PHOTO_DIR, safePhotoId(id)), data);
+        fs.writeFileSync(path.join(PHOTO_DIR, `${safePhotoId(id)}.type`), contentType);
+      },
+      async load(id) {
+        const file = path.join(PHOTO_DIR, safePhotoId(id));
+        if (!fs.existsSync(file)) return null;
+        const typeFile = `${file}.type`;
+        const contentType = fs.existsSync(typeFile) ? fs.readFileSync(typeFile, 'utf-8') : 'image/jpeg';
+        return { data: fs.readFileSync(file), contentType };
+      },
+      async remove(id) {
+        for (const f of [safePhotoId(id), `${safePhotoId(id)}.type`]) fs.rmSync(path.join(PHOTO_DIR, f), { force: true });
+      },
+    };
 
 /** Guarantees at least one admin exists so the platform can always be managed. */
 function ensureFoundingAdmin() {
@@ -529,6 +566,16 @@ export async function createApp() {
   app.use('/api', (req: Request, res: Response, next: NextFunction) => {
     if (req.method === 'GET' || req.path.startsWith('/stream/chunk')) return next();
     return writeLimiter(req, res, next);
+  });
+
+  // ==========================================
+  // IN-APP PLAYER AUCTION
+  // ==========================================
+  registerAuctionRoutes(app, {
+    getDb: () => dbState,
+    commit: broadcastStateUpdate,
+    requireAdmin: requireRole(['admin']),
+    photos: auctionPhotoStore,
   });
 
   // ==========================================

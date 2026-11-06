@@ -328,6 +328,84 @@ export interface AppUser {
   assignedMatchIds?: string[]; // Allowed match IDs for scorer
 }
 
+// ==========================================
+// AUCTION (KPL-style player auction run inside the app)
+// ==========================================
+
+export type AuctionPlayerType = 'auction' | 'owner' | 'icon';
+export type AuctionRole = 'Batsman' | 'Bowler' | 'All-rounder' | 'Wicketkeeper';
+
+export interface AuctionPlayer {
+  /** Also the id of the matching app Player (state.players) */
+  id: string;
+  number: string;
+  name: string;
+  city?: string;
+  role: AuctionRole;
+  base: number;
+  playerType: AuctionPlayerType;
+  /** Team for owner / icon players (they skip the auction) */
+  teamId?: string;
+  matches?: number;
+  runs?: number;
+  wickets?: number;
+  /** External photo URL (e.g. from Excel) */
+  photoUrl?: string;
+  /** Set when a photo was uploaded; served from /api/auction/photos/:id?v=photoVersion */
+  photoVersion?: number;
+  createdAt: number;
+}
+
+export interface AuctionRecord {
+  playerId: string;
+  status: 'SOLD' | 'UNSOLD';
+  teamId?: string;
+  price: number;
+  /** 1 = first auction, 2 = one-time re-auction */
+  round: 1 | 2;
+  at: number;
+}
+
+export interface AuctionRules {
+  purse: number;
+  balanceMode: 'none' | 'topup' | 'auto';
+  /** Deducted from every purse for the pre-assigned owner + icon players */
+  fixedDeduction: number;
+  /** Players each team has before the auction (owner + icons), used when none are registered */
+  fixedPlayersPerTeam: number;
+  minPlayers: number;
+  maxPlayers: number;
+  minBasePrice: number;
+  bonusTrigger: number;
+  bonusAmount: number;
+  incrementMode: 'auto' | 'manual';
+  manualIncrement: number;
+}
+
+export type AuctionPresentation = 'idle' | 'shuffling' | 'entry' | 'bidding' | 'sold' | 'unsold';
+
+export interface AuctionLive {
+  currentPlayerId?: string;
+  bid: number;
+  leadingTeamId?: string;
+  presentation: AuctionPresentation;
+  /** Previous bids for undo (most recent last) */
+  history: { bid: number; leadingTeamId?: string }[];
+  updatedAt: number;
+}
+
+export interface AuctionState {
+  name: string;
+  teamIds: string[];
+  players: Record<string, AuctionPlayer>;
+  records: Record<string, AuctionRecord>;
+  rules: AuctionRules;
+  topups: Record<string, number>;
+  reAuctionStarted: boolean;
+  live: AuctionLive;
+  updatedAt: number;
+}
+
 export interface AppDatabase {
   matches: Record<string, Match>;
   tournaments: Record<string, Tournament>;
@@ -337,6 +415,8 @@ export interface AppDatabase {
   /** Firestore auction catch-up cursor (serverless mode): highest updatedAt already applied */
   auctionSyncCursor?: number;
   auctionSyncMap?: Record<string, { status: string; teamId?: string; soldPrice?: number; updatedAt: number }>;
+  /** In-app player auction */
+  auction?: AuctionState;
   lastUpdated: number;
 }
 

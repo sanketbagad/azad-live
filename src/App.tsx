@@ -18,6 +18,7 @@ import { QuickMatchModal } from './components/QuickMatchModal';
 import { TournamentModal } from './components/TournamentModal';
 import { AdminDashboardView } from './components/AdminDashboardView';
 import { AuctionHubPortal } from './components/AuctionHubPortal';
+import { AuctionDisplay } from './components/auction/AuctionDisplay';
 import { AuthModal } from './components/AuthModal';
 import { LiveStreamStudio } from './components/streaming/LiveStreamStudio';
 import { AppShell } from './components/layout/AppShell';
@@ -34,6 +35,7 @@ const urlParams = new URLSearchParams(window.location.search);
 const IS_OBS_STANDALONE =
   urlParams.get('obs') === 'true' || urlParams.get('overlay') === 'true' || window.location.pathname.startsWith('/overlay');
 const IS_PUBLIC_SHARE = urlParams.get('public') === 'true';
+const IS_AUCTION_DISPLAY = urlParams.get('auction') === 'display';
 const OBS_THEME =
   urlParams.get('theme') ||
   (window.location.pathname.startsWith('/overlay/') ? window.location.pathname.replace('/overlay/', '') : undefined);
@@ -134,6 +136,9 @@ function MainApp() {
   }
   if (IS_PUBLIC_SHARE) {
     return <PublicShareView />;
+  }
+  if (IS_AUCTION_DISPLAY) {
+    return <AuctionDisplay standalone />;
   }
 
   // ---------- Sign-in gate ----------
